@@ -116,6 +116,12 @@ void GpuScratch::Ensure(const ModelMeta& c, int64_t seq) {
   Need(gate, seq * c.intermediate);
   Need(up, seq * c.intermediate);
   Need(logits, seq * c.vocab);
+  // 采样的概率缓冲：**按 vocab 备，不乘 seq** —— 它一步只要一行（P3）。
+  // ⚠️ 与上面那批的区别值得记一笔：那些缓冲的下标是"段内局部位置"，与 seq 同
+  // 尺度；这块是"词表下标"，与 seq 无关。CPU 引擎当初那个"第二轮进程无声消失"
+  // 的堆越界，根子就是"按一个尺度备、按另一个尺度索引"。这里两者都不缩容
+  // （Need 只增不减），所以整类问题不可达。
+  Need(probs, c.vocab);
   const size_t tok_bytes = static_cast<size_t>(seq) * sizeof(int32_t);
   if (toks.size() < tok_bytes) toks.Alloc(tok_bytes);
   // argmax 的落点。放在这里分配而不是在 Generate 里 —— 每步 cudaMalloc 一次
@@ -126,7 +132,7 @@ void GpuScratch::Ensure(const ModelMeta& c, int64_t seq) {
 int64_t GpuScratch::bytes() const {
   int64_t n = 0;
   for (const DeviceBuffer* b : {&x, &h, &q, &k, &v, &attn, &proj, &gate, &up,
-                                &toks, &logits, &argmax_idx}) {
+                                &toks, &logits, &probs, &argmax_idx}) {
     n += static_cast<int64_t>(b->size());
   }
   return n;

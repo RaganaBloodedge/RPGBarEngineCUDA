@@ -72,6 +72,10 @@ class GpuScratch {
   DeviceBuffer up;    // [seq, intermediate]
   DeviceBuffer toks;  // [seq] int32
   DeviceBuffer logits;  // [seq, vocab]
+  // 采样的概率缓冲（P3）：长度 = vocab，**与 seq 无关**（一步只需要一行分布）。
+  // 放进 scratch 而不是就地分配：采样每步一次，而 cudaMalloc 是同步操作
+  // （几十微秒）；decode 一步总共才几毫秒，省下来的是白捡的。
+  DeviceBuffer probs;  // [vocab]
   // argmax 的结果落点（1 个 int32）。做成一个具名槽位而不是就地 cudaMalloc：
   // 每步分配一次 4 字节是同步操作（几十微秒），而且**不许用命名空间级静态**
   // 的 DeviceBuffer 来缓存它 —— 那种静态对象要到进程退出才析构，那时 CUDA

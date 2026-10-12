@@ -83,6 +83,10 @@ set(RPG_CUDA_SOURCES
   src/kv_cache_gpu.cu
   src/kernels_gpu.cu
   src/qwen3_gpu.cu
+  # 采样的设备端实现（P3）。⚠️ sampler.h 是**同源副本**（语义与默认值的唯一来源，
+  # 在 RPG_HOST_SOURCES 之外单独说明 —— 它没有 .cc，实现由设备侧重写）；
+  # sampler_gpu.cu 才是本仓库自己的代码。
+  src/sampler_gpu.cu
 )
 
 # ------------------------------------------------------------------ object 库
@@ -178,4 +182,9 @@ if(RPG_HAS_CUDA)
   # tools/cpu_ref_gen.cc，由 tools/build_cpu_ref.sh 从 RPGBarEngine 的源码
   # 现编（理由见 DESIGN §7 末：参考实现必须是"真的在跑的那一份"）。
   rpg_add_tool(gen_check tools/gen_check.cu)
+  # P3 判据之一：设备端采样（temperature / top_k / top_p + counter-based 随机源）。
+  # **不需要模型、不需要权重** —— 两边喂同一份从文件来的 logits 就能逐 token 对拍
+  # （理由见 tools/sample_check.cu 的头注释与 DESIGN §7）。参考侧是
+  # tools/cpu_ref_sample.cc，由 build_cpu_ref.sh 从 CPU 引擎的 sampler.cc 现编。
+  rpg_add_tool(sample_check tools/sample_check.cu)
 endif()
