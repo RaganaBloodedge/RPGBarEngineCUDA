@@ -61,6 +61,12 @@ ABI_FILES = [
     ("src/rpg_engine.def", "src/rpg_engine.def"),
 ]
 
+# tools/ 下的两个也是逐字复制来的（npy 读写 + 平台无关的命令行工具）。
+# 为什么要一起盯着：判据脚本要拿同一套 npy 布局和同一套读文件写法，
+# 两边不一致会表现为"对拍脚本报形状不符"，而去查模型 —— 又是一次归因跑偏。
+# ⚠️ 复制过来之后**不许改**；要改就先改上游，再同步（docs/DESIGN.md §10）。
+REUSED_TOOLS = ["npy.h", "cli_util.h"]
+
 
 def human_size(n: int) -> str:
     for unit in ("B", "KiB", "MiB"):
@@ -134,6 +140,10 @@ def main() -> int:
     print("\n== 同源副本（docs/DESIGN.md §3 的『复用』栏）==")
     for f in REUSED_SRC:
         compare(os.path.join("src", f), os.path.join("src", f))
+
+    print("\n== 同源副本（tools/，同上）==")
+    for f in REUSED_TOOLS:
+        compare(os.path.join("tools", f), os.path.join("tools", f))
 
     print(f"\n结果：{same} 一致，{diff} 分叉，{missing} 缺失")
     if bad:

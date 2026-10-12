@@ -145,7 +145,10 @@ def main() -> int:
             check("session_create 成功", s >= 0, f"句柄={s}")
             if s >= 0:
                 check("session_reset 成功", lib.rpg_engine_session_reset(s) == 0)
-                # P0：generate 必须**明确报错**，而不是返回一段假文本。
+                # generate 必须**明确报错**，而不是返回一段假文本。
+                # P1 之后这条依然要守：整网前向已经能跑（tools/layer_check 里
+                # 逐层对拍过），但它**没接进 ABI** —— 报错文案必须把这个区别说清，
+                # 否则宿主会以为是"没 GPU / 没编 CUDA"，去查错方向。
                 out = lib.rpg_engine_generate(s, b'{"messages":[{"role":"user","content":"hi"}]}')
                 check("generate 尚未实现 → 返回 NULL", not out)
                 gerr = (lib.rpg_engine_last_error() or b"").decode("utf-8", "replace")
