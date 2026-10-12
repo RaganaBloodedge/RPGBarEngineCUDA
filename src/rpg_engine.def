@@ -1,0 +1,20 @@
+; rpg_engine.def —— Windows 导出的精确清单。
+;
+; 不给 .def 时 MinGW ld 会**导出全部符号**：内部 C++ 符号、std::string 的模板
+; 实例、libgcc 的 _Unwind_* 全在里面（实测有 200+ 条）。对一个"只承诺 C ABI"
+; 的动态库来说这是纯负担 —— 宿主可能误解析到内部符号，导出表也白白变大。
+;
+; 这里列出且只列出 include/rpg_engine.h 里的 10 个函数。新增 ABI 函数时
+; **必须同步加到这里**，否则宿主拿到的会是 dllimport 缺失的报错。
+LIBRARY rpg_engine
+EXPORTS
+    rpg_engine_version
+    rpg_engine_last_error
+    rpg_engine_load_model
+    rpg_engine_unload_model
+    rpg_engine_session_create
+    rpg_engine_session_destroy
+    rpg_engine_session_reset
+    rpg_engine_generate
+    rpg_engine_free
+    rpg_engine_model_info

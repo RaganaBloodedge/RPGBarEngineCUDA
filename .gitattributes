@@ -1,0 +1,32 @@
+# 统一行尾。这个库要在 Windows / Linux / 后续 macOS 上构建，也包含 shell
+# 脚本，所以全部按 LF 存储与检出。
+#
+# ⚠️ 对本仓库而言这条不只是"习惯"，它是一条**正确性约束**：src/ 下有一批文件是从
+#    RPGBarEngine 逐字复制来的（docs/DESIGN.md §3），tests/check_sync.py 逐字节
+#    比较它们。若检出时被改写成 CRLF，那个校验会在别人机器上报"假分叉"。
+#
+# 例外：给 MSVC 用的 .bat/.ps1/.sln/.vcxproj 保留 CRLF（有些老工具对 LF 不友好）。
+#       本仓库的 CUDA 构建目标就是 MSVC（见 CMakeLists.txt），这条例外用得上。
+* text=auto eol=lf
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+*.sln   text eol=crlf
+*.vcxproj text eol=crlf
+
+# 二进制/大文件：不做任何转换，也不在 diff 里显示内容
+*.gguf        binary
+*.safetensors binary
+*.bin         binary
+*.onnx        binary
+*.sbs         binary
+*.dll         binary
+*.exe         binary
+*.a           binary
+*.lib         binary
+*.o           binary
+*.obj         binary
+*.png         binary
+*.jpg         binary
+*.ico         binary

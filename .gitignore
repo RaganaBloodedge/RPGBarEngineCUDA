@@ -1,0 +1,34 @@
+# 构建产物
+build/
+out/
+*.dll
+*.so
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.o
+*.a
+
+# CUDA / CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+.cache/
+
+# 模型权重（体积大，不入库；用 scripts/fetch_model.py 拉）
+models/
+*.gguf
+*.sbs
+
+# Python（tools/ 里的辅助脚本）
+__pycache__/
+*.py[cod]
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
