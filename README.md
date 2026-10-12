@@ -18,7 +18,7 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 | P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿 |
 | P1 | 权重上卡 + 整网前向对拍 | ✅ **完成** —— 两条判据全绿（见下） |
 | P2 | KV Cache（fp16）+ 增量解码 + 贪心逐 token 对拍 | ✅ **完成** —— 三条判据全绿，**32/32 个 token 与 CPU 引擎完全一致** |
-| P3 | 采样（**第一步已完成**）/ 工具调用 / 接入 RPGBar | 🔶 **进行中** —— 设备端采样三条判据全绿（**不需要模型**）；还差接进生成循环与 ABI |
+| P3 | 采样（**已接进生成循环**）/ 工具调用 / 接入 RPGBar | 🔶 **进行中** —— 设备端采样两条判据全绿（一条**不需要模型**、一条走真实 decode 循环）；还差挂进 ABI session 与换 `rpg_engine.dll` |
 | P4 | 融合 kernel、CUDA Graph、量化直算 | 未开始 |
 
 **P1 的一句话结论**：同一份 GGUF、同一串 token，GPU 的 28 层前向与 CPU 引擎**逐层对得上**
@@ -38,6 +38,16 @@ logits，两边就该给出同一个 token）—— u 表 **192/192 位模式相
 （后者专门验二分搜索覆盖整个 key 空间）。
 筛选不用排序：top_k 找"第 k 大值"、top_p 找"累积概率切点"，各 32 次迭代遍历一遍词表 ——
 顺手把 CPU 版"`top_p` 全量 `std::sort`（10.25 ms）"那个待办一起解决了。
+
+**P3 第二步（接进生成循环）的一句话结论**：`GpuGenerateGreedy` 变成 `GpuGenerate` 的
+薄包装（与 CPU 版 `GenerateGreedy` 同构），采样在 decode 循环里真的生效了，而**贪心路径
+逐位没变** —— `run_p2.sh` 的 32/32 逐 token 对拍与满量程 **6.48e-4** 与 P2 记录的数字
+一模一样。这一层的判据不能与 CPU 逐 token 对拍（接在模型后面的采样先差了 fp16 舍入，
+理由见 [设计文档 §6 第 10 条](docs/DESIGN.md)），所以换成五条**只看自己**的不变量：
+同 seed 两遍**逐位相同**（32/32，证明引擎仍是纯函数）、换 seed 序列就变（31/32 处不同）、
+`T=0` 加筛选参数与贪心逐位相同、`top_k=2` 时每步都落在该步前 2 名内、以及
+**counter 用的是绝对位置**——把输出接在 prompt 后冷跑一遍，序列整体错一位
+**逐位相同**（31/31）。
 
 **工具链现状**：CUDA Toolkit **13.2 已装在 WSL（Ubuntu 24.04）**（`/usr/local/cuda`，
 版本与宿主 `nvidia-smi` 报的 13.2 精确对齐）。Windows 侧仍没有 nvcc / cmake / MSVC ——
@@ -97,6 +107,7 @@ apt install python3-numpy        # cmp_layers.py / cmp_gen.py / cmp_sample.py �
 bash tests/run_p1.sh             # ① 反量化逐位对拍 ② 整网逐层对拍
 bash tests/run_p2.sh             # ⓿ KV 映射（不需要模型）① KV 自检 ② 逐 token 对拍
 bash tests/run_p3.sh             # 设备端采样（不需要模型、不需要权重，几秒跑完）
+bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量（要权重）
 ```
 
 分两档的理由 —— **"骨架能编、错误路径说人话"和"算力实现了没有"是两件事**，
@@ -117,6 +128,9 @@ bash tests/run_p3.sh             # 设备端采样（不需要模型、不需要
 | **`tests/run_p2.sh`**（P2 ②） | WSL + CUDA 13.2 | 逐 token **32/32 完全一致**；数值层满量程 6.48e-4；cache 长度不变量两侧都成立 |
 | **`sample_check` + `cmp_sample.py`**（P3 ①，词表 4096，**不需要模型**） | WSL + CUDA 13.2 | u 表 **192/192 位模式相同**；概率满量程误差 **2.31e-7**（判据 1e-5）且保留集合逐例一致；token **192/192 逐位相同** |
 | **同上（词表 151936，真实词表）** | WSL + CUDA 13.2 | u 表 192/192；满量程 **1.66e-7**；保留集合一致；token **192/192 逐位相同** |
+| **`gen_sample_check` + `run_p3_gen.sh`**（P3 ②，要权重） | WSL + CUDA 13.2 | 同 seed 两遍 **32/32 逐位相同**；换 seed **31/32 处不同**；`T=0`+筛选参数与贪心**逐位相同**；`top_k=2` 每步都落前 2 名（32/32）；counter 绝对位置：暖/冷缓存 **31/31 逐位相同** |
+| **回归 `run_p2.sh`（新循环）** | WSL + CUDA 13.2 | 逐 token 仍 **32/32 完全一致**，满量程仍 **6.48e-4**（与 P2 记录的数字一模一样） |
+| **回归 `run_p1.sh`** | WSL + CUDA 13.2 | 29 项最差 p99 **1.05e-4**；logits max\|Δ\| **1.431e-4**（与 P1 记录一致） |
 
 ### P1 实测（21 token prefill，同一 prompt / 同一份 GGUF）
 
@@ -142,6 +156,16 @@ bash tests/run_p3.sh             # 设备端采样（不需要模型、不需要
 
 > 98 tok/s 离 P4 的 1000 tok/s 目标还远，**但现在不该优化**：21 个 token 的 GEMM 每个都是
 > `1×2048` 乘 `2048×6144`，小到吃不满 26 个 SM。P4 的目标要在 ≥512 token 上量。
+
+### P3 实测（采样接进生成循环之后）
+
+| 项 | 实测 |
+| --- | --- |
+| decode 32 token（T=0，走新循环） | 1932.9 ms（**16.6 tok/s**）—— 与 P2 的 18.5 是同一量级的运行间波动；贪心分支调的仍是同一个 `GpuArgMax`，**没有新增显存搬运**（概率缓冲 607 KB 是 `GpuScratch` 里常驻的，不逐 token 分配） |
+| decode 32 token（T=1，真采样） | 2141.7 ms（**14.9 tok/s**）—— 每步多一次 `FilterToProbs`（两次 32 轮二分 + 一次串行逆变换，~0.5 ms） |
+
+两个数字都离 P4 的 60 tok/s 目标还远，而且**离瓶颈很远**：decode 每步约 400 次 kernel
+启动 + 一次同步才是主因（见上面 P2 那张表）。采样加进去的是"几步 kernel"，不是"几百步"。
 
 ### ⚠️ 首次真编译（P0 / P1 / P2 各一次）暴露的真问题
 
@@ -170,6 +194,14 @@ bash tests/run_p3.sh             # 设备端采样（不需要模型、不需要
 （`hi - lo + 1` 在 `lo=0 / hi=0xFFFFFFFF` 时溢出成 0 ⇒ 死循环），以及逆变换的
 求和顺序本身就是判据的一部分（并行扫描会与 CPU 选到不同的 token）。
 
+**P3 第二步（接进生成循环）也没有编译坑，但踩了一个"判据前提"的坑**，值得单独记：
+我拿 `top_k = 1` 当"支持集只剩一个元素 ⇒ 必然退化成 argmax"来写断言，**红了一片**。
+查契约才发现 `sampler.h` 里 top_k 的生效条件是 **`top_k > 1 && top_k < n`**，
+所以 **`1` 与 `0` 一样算"关闭"**（注释只写了 "0 = 关闭"）。
+⇒ 代码没错，错的是判据的前提。**判据的前提也要去读契约，不能凭常识**——
+尤其当"常识"（只留 1 个就该等于 argmax）听起来毫无破绽的时候。而 `sampler.h` 是
+**同源副本**，不许改，所以这里只记录、不修上游。
+
 ## 用起来
 
 产物是 `rpg_engine.dll` / `librpg_engine.so`，与 CPU 版**同名同 ABI**。
@@ -186,7 +218,7 @@ include/rpg_engine.h    ← 逐字复制自 RPGBarEngine，是唯一契约（两
 src/                    ← host 层：ABI、GGUF、分词器、ChatML、工具解析、元数据推导（复用/新增）
                           + CUDA 计算层（重写）：gpu_model.cu（权重上卡）
                             / kv_cache_gpu.cu（fp16 KV Cache）/ kernels_gpu.cu（算子）
-                            / qwen3_gpu.cu（前向 + 增量解码 + 贪心）
+                            / qwen3_gpu.cu（前向 + 增量解码 + 生成循环）
                             / sampler_gpu.cu（采样：T / top_k / top_p + 随机源）
                           ← 另有 sampler.h：**逐字复制**的同源副本（采样参数的语义是契约）
 docs/DESIGN.md          ← 设计决策、阶段判据、对拍策略、与上位仓库的同步方式
@@ -194,10 +226,12 @@ scripts/                ← fetch_model.py（下权重与对拍参考物）
 tests/                  ← check_sync.py（副本有没有跑偏）、abi_smoke.py（ABI 冒烟）、
                           run_p1.sh / cmp_layers.py（P1 一键判据）、
                           run_p2.sh / cmp_gen.py（P2 一键判据）、
-                          run_p3.sh / cmp_sample.py（P3 一键判据，不需要模型）
+                          run_p3.sh / cmp_sample.py（P3 一键判据，不需要模型）、
+                          run_p3_gen.sh（P3 的生成循环判据，要权重）
 tools/                  ← cuda_check / dequant_check / layer_check / gen_check
                           / kv_map_check（KV 映射，不需要模型）
                           / sample_check（采样，不需要模型）
+                          / gen_sample_check（采样接进 decode 后的不变量，要模型）
                           + build_cpu_ref.sh（现编 CPU 引擎做参考侧：
                             forward_check / cpu_ref_gen / cpu_ref_sample）
                           + cpu_ref_gen.cc / cpu_ref_sample.cc（只有 main，实现来自 CPU 引擎）
