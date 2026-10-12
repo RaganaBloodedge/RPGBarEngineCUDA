@@ -15,11 +15,17 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿（见下） |
-| P1 | 权重上卡 + 单层前向对拍 | 未开始 |
-| P2 | 整网贪心生成对拍 | 未开始 |
+| P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿 |
+| P1 | 权重上卡 + 整网前向对拍 | ✅ **完成** —— 两条判据全绿（见下） |
+| P2 | KV Cache + 增量解码 + 贪心逐 token 对拍 | **下一步** |
 | P3 | 采样 / 工具调用 / 接入 RPGBar | 未开始 |
 | P4 | 融合 kernel、CUDA Graph、量化直算 | 未开始 |
+
+**P1 的一句话结论**：同一份 GGUF、同一串 token，GPU 的 28 层前向与 CPU 引擎**逐层对得上**
+（残差流最差 p99 = **1.05e-4**，判据 1e-3；argmax 21/21 一致），反量化**逐位相同**（0 bit 差异）。
+GPU prefill 21 token 只用 **213.7 ms**，同一份 CPU 跑 **3081.1 ms** ⇒ **14.4×**。
+⚠️ 但这还不是"DM 一轮 2 秒"——那要求 P2 的 KV Cache 与 P3 的接入，且 prefill 目标要在长
+prompt（≥512 token）上量，见 [设计文档 §5](docs/DESIGN.md)。
 
 **工具链现状**：CUDA Toolkit **13.2 已装在 WSL（Ubuntu 24.04）**（`/usr/local/cuda`，
 版本与宿主 `nvidia-smi` 报的 13.2 精确对齐）。Windows 侧仍没有 nvcc / cmake / MSVC ——
@@ -60,7 +66,7 @@ bash build_host.sh          # 产物 build/rpg_engine.dll（host-only）
 P0 的判据分两档。**不需要显卡的那档在 Windows 上跑**：
 
 ```bash
-python tests/check_sync.py      # 22 个同源副本 + 2 个 ABI 文件与上位仓库逐字节一致
+python tests/check_sync.py      # 22 个同源副本（20 src + 2 tools）+ 2 个 ABI 文件 = 24 项逐字节一致
 python tests/abi_smoke.py --lib build/rpg_engine.dll
 python tests/abi_smoke.py --lib build/rpg_engine.dll --model models/Qwen3-1.7B-Q4_K_M.gguf
 ```
@@ -72,31 +78,51 @@ python3 tests/abi_smoke.py --lib ~/cuda-build/librpg_engine.so --model models/Qw
 ~/cuda-build/cuda_check
 ```
 
+**P1 的两条判据**（一键，在 WSL 里跑）：
+
+```bash
+apt install python3-numpy        # cmp_layers.py 要用（判据脚本唯一的外部依赖）
+bash tests/run_p1.sh             # ① 反量化逐位对拍 ② 整网逐层对拍
+```
+
 分两档的理由 —— **"骨架能编、错误路径说人话"和"算力实现了没有"是两件事**，
 前者不该被显卡卡住。
 
-### 已验过的（P0 全绿，2026-10-12）
+### 已验过的（2026-10-12）
 
 | 项 | 环境 | 结果 |
 | --- | --- | --- |
-| `check_sync.py` | WSL | 22 一致 / 0 分叉 / 0 缺失 |
+| `check_sync.py` | WSL | **24 一致 / 0 分叉 / 0 缺失**（20 src + 2 tools 副本 + 2 个 ABI 文件） |
 | `abi_smoke.py`（host-only，带真实权重） | Windows | 32 通过 / 0 失败 |
 | `abi_smoke.py`（CUDA 产物，带真实权重） | WSL | 32 通过 / 0 失败 |
 | `cuda_check` | WSL + CUDA 13.2 | RTX 5060 Laptop / 算力 **12.0** / 26 SM / 显存 6.9+8.0 GiB；device 计算 + 搬运全对 |
+| **`dequant_check`**（P1 ①） | WSL + CUDA 13.2 | f16→f32 穷举 65536 值全对；反量化 131072 个元素 **0 个 bit 不同** |
+| **`tests/run_p1.sh`**（P1 ②） | WSL + CUDA 13.2 | 残差流 29 项 p99 ≤ **1.05e-4**（判据 1e-3）；logits p99 5.98e-5；argmax **21/21** 一致 |
 
-### ⚠️ 首次编译暴露的两个真问题
+### P1 实测（21 token prefill，同一 prompt / 同一份 GGUF）
 
-这两个都是 **host-only 构建永远看不到的**（`RPG_HAS_CUDA` 未定义时整段被 `#ifdef` 掉），
-也正是"没验过就不算"的实证：
+| 项 | CPU（12 线程） | GPU（RTX 5060 Laptop） |
+| --- | --- | --- |
+| 前向耗时 | 3081.1 ms | **213.7 ms** |
+| 吞吐 | ~7 tok/s | **98.3 tok/s**（prefill 口径） |
+| 权重上卡 | — | 4.9 s（1.03 GiB，含从 `/mnt/e` 经 9p 读盘） |
+| 显存 | — | 权重 1.03 GiB + 暂存 14.8 MB，设备剩余 5.62 GiB |
 
-1. **`cuda_common.h` 把 `#include <cuda_runtime.h>` 放在了 `namespace rpg {` 里面** ——
-   libstdc++ 的 `namespace std` 被嵌套成 `rpg::std`，此后该 TU 里每个 `std::` 名字都解析不到，
-   而报错点全落在标准库内部（`'vector' in namespace 'rpg::std' does not name a template type`、
-   `'is_nothrow_move_constructible' was not declared in this scope`），极难从现象反推。
-   **修法**：include 移到 namespace 之前，并改用 `cuda_runtime_api.h`（host 侧只需要 `cudaError_t`
-   与内存 API，完整头会带进 `__host__`/`__device__` 那一套宏）。
-2. **`CMakeLists.txt` 的 `cuda_check` 目标漏了 `src/cuda_common.cc`** —— 链接期
-   `undefined reference to rpg::DescribeDevice`。`.cu` 里只有 CUDA 那一半，描述文本那一半在 `.cc`。
+> 98 tok/s 离 P4 的 1000 tok/s 目标还远，**但现在不该优化**：21 个 token 的 GEMM 每个都是
+> `1×2048` 乘 `2048×6144`，小到吃不满 26 个 SM。P4 的目标要在 ≥512 token 上量。
+
+### ⚠️ 首次真编译（P0、P1 各一次）暴露的真问题
+
+下面这些**都是 host-only 构建永远看不到的**（`RPG_HAS_CUDA` 未定义时整段被 `#ifdef` 掉），
+也正是"没验过就不算"的实证。**P0 抓到 2 个、P1 抓到 4 个** —— 全部细节在
+[设计文档 §8](docs/DESIGN.md)，这里只列名字：
+
+P0：`cuda_common.h` 把 CUDA 头 include 进了 `namespace rpg`（报错全落在标准库内部）；
+`cuda_check` 目标漏了 `cuda_common.cc`（链接期才炸）。
+
+P1：`CMAKE_CUDA_STANDARD` 默认 17 而 `dtypes.h` 用了 `std::bit_cast`；
+`add_compile_options(-O2)` 与 Release 的 CUDA `-O3` 冲突（**编译通过但悄悄降档**）；
+静态成员函数里的 lambda 捕了 `this`；两个 `.cu` 漏 include。
 
 ## 用起来
 
@@ -111,12 +137,14 @@ python scripts/engine_probe.py     # 在 RPGBar 仓库里跑，会打印引擎�
 
 ```
 include/rpg_engine.h    ← 逐字复制自 RPGBarEngine，是唯一契约（两边都不许单独改）
-src/                    ← host 层：ABI、GGUF、分词器、ChatML、工具解析（复用）
-                          + CUDA 计算层（重写）
+src/                    ← host 层：ABI、GGUF、分词器、ChatML、工具解析、元数据推导（复用/新增）
+                          + CUDA 计算层：gpu_model.cu / kernels_gpu.cu / qwen3_gpu.cu（重写）
 docs/DESIGN.md          ← 设计决策、阶段判据、对拍策略、与上位仓库的同步方式
 scripts/                ← fetch_model.py（下权重与对拍参考物）
-tests/                  ← check_sync.py（副本有没有跑偏）、abi_smoke.py（ABI 冒烟）
-tools/                  ← cuda_check 等命令行工具
+tests/                  ← check_sync.py（副本有没有跑偏）、abi_smoke.py（ABI 冒烟）、
+                          run_p1.sh（P1 一键判据）、cmp_layers.py（逐层误差统计）
+tools/                  ← cuda_check / dequant_check / layer_check
+                          + build_cpu_ref.sh（现编 CPU 引擎做参考侧）
 ```
 
 ## 许可证
