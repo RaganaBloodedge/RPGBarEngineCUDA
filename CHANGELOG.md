@@ -165,6 +165,66 @@
   的说法不同：**真做下去才发现，P2 的全部工作量在"把增量解码做对"，接 ABI 是 P3 的
   实体**（DESIGN §5 的阶段表本来也是这么分的）。
 
+### 新增（P3 第一步：设备端采样）
+
+- **`src/sampler.h`**：从 RPGBarEngine **逐字复制**的同源副本 —— 采样参数的字段 /
+  默认值 / 语义（HF 同款的 top-k 并列规则、top-p 至少留一个 token、`temperature <= 0`
+  即贪心且**不消耗随机数**）是**契约**，抄成两份迟早会漂。只有头文件是副本：
+  `sampler.cc` 依赖 CPU 侧的 `kernels.h`，搬过来等于把 CPU 前向也搬进来（那是"重写"
+  那一栏的事）。副本数 22 → 23，连 2 个 ABI 文件共 **25 项**由 `check_sync.py` 盯着。
+- **`src/sampler_gpu.{h,cu}`**：设备端采样（重写，不与上游同步）。
+  - `GpuFilterToProbs`：温度缩放 → top_k → softmax → top_p，与 CPU 版
+    `FilterToProbs` 同语义。**两条筛选都不排序**：top_k 找"第 k 大值"
+    （谓词 `|{key ≥ t}| ≥ k`）、top_p 找"累积概率的切点"（谓词 `Σ{p ≤ t} ≤ 1 - top_p`），
+    各 32 次迭代遍历一遍词表（每次一个块内归约）。CPU 版那边是
+    `nth_element` + 全量 `std::sort`（151936 个元素，`FilterToProbs` 11 ms 里排序占
+    10.25 ms）—— 这条顺手把它一起解决了。
+  - `GpuSampleToken`：贪心（`temperature <= 0`）退化为 argmax 且**不消耗随机数**
+    （与 CPU 版同序，保住"不传 temperature 的老路径逐位不变"）；否则用
+    `u = CounterUniform(seed, 绝对位置)` 在筛选后的分布上做逆变换。
+  - `GpuInverseSample`：**一个线程、按下标顺序**串行累加。并行扫描会改掉求和顺序，
+    于是 u 落在累积概率边界上时会与 CPU 选到不同的 token —— 而"同一份 logits +
+    同一个 seed ⇒ 同一个 token"正是判据本身。代价是词表 151936 时 ~0.5 ms 的串行链
+    （decode 一步 54 ms，占比 ~1%）。
+  - `DevSplitMix64` / `DevCounterRng` / `DevCounterUniform`：与 CPU 版逐字对应
+    （三行整数运算 + 乘一个 2 的幂 ⇒ 两边判据是**逐位相同**）。
+- **判据工具与脚本**（都**不需要模型、不需要权重**，几秒跑完）：
+  `tools/sample_check.cu`（写出两边共用的用例矩阵 `cases.tsv` 与 `logits.bin`，
+  跑 GPU 侧）、`tools/cpu_ref_sample.cc`（参考侧：只有 main，实现用 CPU 引擎的
+  `sampler.cc`，由 `build_cpu_ref.sh` 现编 —— 它多了第 4 个产物 `cpu_ref_sample`）、
+  `tests/cmp_sample.py`（判据：u 表逐位 / 概率满量程 / 保留集合 / token）、
+  `tests/run_p3.sh`（一键，词表 4096 与 151936 各跑一遍）。
+- `GpuScratch` 加 `probs` 缓冲（长度 = **vocab**，与 seq 无关 —— 一步只要一行分布）。
+
+### 说明（P3）
+
+- **P3 第一步的三条判据全绿**（2026-10-12，WSL + CUDA 13.2 + RTX 5060 Laptop；
+  12 条用例 × 每例 16 个 u）：
+  - u 表（`CounterUniform`）：**192/192 位模式相同**（两个词表各一遍）；
+  - 概率分布：满量程误差最大 **2.31e-7**（词表 4096）/ **1.66e-7**（151936），
+    判据 1e-5，且**保留集合逐例一致**（哪些 token 没被 top_k/top_p 筛掉是离散判断）；
+  - token：**192/192 逐位相同**。
+  - 词表 151936 那一遍专门用来验二分搜索在**整个 uint32 key 空间**上收敛
+    （小词表测不出"上中点溢出"那类 bug）。
+- ⚠️ **"采样不能逐 token 对拍"这句话要加一个限定**：它针对的是**接在模型后面**的采样
+  （两边 logits 先差了 fp16 的舍入，采样再把差异放大成"整段序列不同"）。把模型摘掉、
+  两边喂同一份从文件读的 logits 之后，判据立刻回来，而且是**逐位**的。
+  这与 P2 用 `kv_map_check` 把"cache 布局"与"fp16 精度"分开是同一个套路：
+  **先把变量的个数降到 1，再判。**
+- 两个**在设计上避开**的陷阱（不是踩到才发现的）：
+  ① 两级二分的上中点必须用 `uint64` 算 —— `lo + (hi - lo + 1) / 2` 在
+  `lo = 0 / hi = 0xFFFFFFFF` 时 `hi - lo + 1` 溢出成 0 ⇒ 第一次迭代就 `mid == lo`
+  ⇒ **死循环**（只有词表大到覆盖半个 key 空间才可能踩到）；
+  ② `top_p` 的并列是**未定义**的 —— CPU 在概率精确相等的元素之间取决于 `std::sort`
+  的同值顺序，GPU 的阈值法会把并列的整撮一起剔除。fp32 softmax 的输出里精确并列
+  几乎不出现，判据的测试数据也刻意避开（唯一的并列用例只开 `top_k`，那条是良定义的：
+  "阈值取第 k 大值、并列一起保留"）。
+- 顺带：**P3 这一步一次编译通过，没有新的"编得过但错了"的坑** —— 前两个阶段抓到的
+  那些（CUDA 标准版本、`-O2` 落到 nvcc、include 不能进 namespace、nvcc 不接受
+  `void*` 隐式转换、注释行尾的 `\`）都写在设计文档与文件头注释里，写新代码时照着绕开。
+- **ABI 行为仍然没有任何变化**：`include/rpg_engine.h` 一个字节未动，`generate` 的
+  报错文案与 P2 时相同（采样要真正生效，得等它接进生成循环与 `Session`）。
+
 ### 说明
 
 - **P0 的两档判据全绿**（2026-10-12）。不需要显卡的那一档在 Windows 上跑

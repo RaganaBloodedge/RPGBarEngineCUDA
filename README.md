@@ -18,7 +18,7 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 | P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿 |
 | P1 | 权重上卡 + 整网前向对拍 | ✅ **完成** —— 两条判据全绿（见下） |
 | P2 | KV Cache（fp16）+ 增量解码 + 贪心逐 token 对拍 | ✅ **完成** —— 三条判据全绿，**32/32 个 token 与 CPU 引擎完全一致** |
-| P3 | 采样 / 工具调用 / 接入 RPGBar | **下一步** |
+| P3 | 采样（**第一步已完成**）/ 工具调用 / 接入 RPGBar | 🔶 **进行中** —— 设备端采样三条判据全绿（**不需要模型**）；还差接进生成循环与 ABI |
 | P4 | 融合 kernel、CUDA Graph、量化直算 | 未开始 |
 
 **P1 的一句话结论**：同一份 GGUF、同一串 token，GPU 的 28 层前向与 CPU 引擎**逐层对得上**
@@ -30,6 +30,14 @@ GPU prefill 21 token 只用 **213.7 ms**，同一份 CPU 跑 **3081.1 ms** ⇒ *
 约 1.3 个 fp16 ULP）。KV 写入的下标映射另有一条**不需要模型**的确定性判据（逐位相同）。
 ⚠️ 但 decode 只比 CPU 快 **1.5 倍** —— 瓶颈已经从"算力"变成"每步约 400 次 kernel 启动
 + 一次同步"，那是 P4 的 CUDA Graph 要解决的事（见 [设计文档 §5](docs/DESIGN.md)）。
+
+**P3 第一步（设备端采样）的一句话结论**：`temperature` / `top_k` / `top_p` 与
+counter-based 随机源都在 GPU 上跑通了，判据**不需要模型、不需要权重**（喂同一份从文件读的
+logits，两边就该给出同一个 token）—— u 表 **192/192 位模式相同**、概率满量程误差
+**1.66e-7**（判据 1e-5）、**192/192 个 token 逐位相同**，词表 4096 与 151936 各跑一遍
+（后者专门验二分搜索覆盖整个 key 空间）。
+筛选不用排序：top_k 找"第 k 大值"、top_p 找"累积概率切点"，各 32 次迭代遍历一遍词表 ——
+顺手把 CPU 版"`top_p` 全量 `std::sort`（10.25 ms）"那个待办一起解决了。
 
 **工具链现状**：CUDA Toolkit **13.2 已装在 WSL（Ubuntu 24.04）**（`/usr/local/cuda`，
 版本与宿主 `nvidia-smi` 报的 13.2 精确对齐）。Windows 侧仍没有 nvcc / cmake / MSVC ——
@@ -70,7 +78,7 @@ bash build_host.sh          # 产物 build/rpg_engine.dll（host-only）
 P0 的判据分两档。**不需要显卡的那档在 Windows 上跑**：
 
 ```bash
-python tests/check_sync.py      # 22 个同源副本（20 src + 2 tools）+ 2 个 ABI 文件 = 24 项逐字节一致
+python tests/check_sync.py      # 23 个同源副本（21 src + 2 tools）+ 2 个 ABI 文件 = 25 项逐字节一致
 python tests/abi_smoke.py --lib build/rpg_engine.dll
 python tests/abi_smoke.py --lib build/rpg_engine.dll --model models/Qwen3-1.7B-Q4_K_M.gguf
 ```
@@ -82,12 +90,13 @@ python3 tests/abi_smoke.py --lib ~/cuda-build/librpg_engine.so --model models/Qw
 ~/cuda-build/cuda_check
 ```
 
-**P1 的两条判据**（一键，在 WSL 里跑）：
+**P1 / P2 / P3 的判据**（一键，在 WSL 里跑）：
 
 ```bash
-apt install python3-numpy        # cmp_layers.py / cmp_gen.py 要用（判据脚本唯一的外部依赖）
+apt install python3-numpy        # cmp_layers.py / cmp_gen.py / cmp_sample.py 要用
 bash tests/run_p1.sh             # ① 反量化逐位对拍 ② 整网逐层对拍
 bash tests/run_p2.sh             # ⓿ KV 映射（不需要模型）① KV 自检 ② 逐 token 对拍
+bash tests/run_p3.sh             # 设备端采样（不需要模型、不需要权重，几秒跑完）
 ```
 
 分两档的理由 —— **"骨架能编、错误路径说人话"和"算力实现了没有"是两件事**，
@@ -97,7 +106,7 @@ bash tests/run_p2.sh             # ⓿ KV 映射（不需要模型）① KV 自�
 
 | 项 | 环境 | 结果 |
 | --- | --- | --- |
-| `check_sync.py` | WSL | **24 一致 / 0 分叉 / 0 缺失**（20 src + 2 tools 副本 + 2 个 ABI 文件） |
+| `check_sync.py` | WSL | **25 一致 / 0 分叉 / 0 缺失**（21 src + 2 tools 副本 + 2 个 ABI 文件） |
 | `abi_smoke.py`（host-only，带真实权重） | Windows | 32 通过 / 0 失败 |
 | `abi_smoke.py`（CUDA 产物，带真实权重） | WSL | 32 通过 / 0 失败 |
 | `cuda_check` | WSL + CUDA 13.2 | RTX 5060 Laptop / 算力 **12.0** / 26 SM / 显存 6.9+8.0 GiB；device 计算 + 搬运全对 |
@@ -106,6 +115,8 @@ bash tests/run_p2.sh             # ⓿ KV 映射（不需要模型）① KV 自�
 | **`kv_map_check`**（P2 ⓿） | WSL + CUDA 13.2 | KV 写入的下标映射：120 个元素**逐位正确**；未写入区间保持为 0（无越界） |
 | **`gen_check` 的 KV 自检**（P2 ①） | WSL + CUDA 13.2 | 满量程误差 **4.09e-4**（判据 1e-3）；逐位置 argmax **21/21** 一致 |
 | **`tests/run_p2.sh`**（P2 ②） | WSL + CUDA 13.2 | 逐 token **32/32 完全一致**；数值层满量程 6.48e-4；cache 长度不变量两侧都成立 |
+| **`sample_check` + `cmp_sample.py`**（P3 ①，词表 4096，**不需要模型**） | WSL + CUDA 13.2 | u 表 **192/192 位模式相同**；概率满量程误差 **2.31e-7**（判据 1e-5）且保留集合逐例一致；token **192/192 逐位相同** |
+| **同上（词表 151936，真实词表）** | WSL + CUDA 13.2 | u 表 192/192；满量程 **1.66e-7**；保留集合一致；token **192/192 逐位相同** |
 
 ### P1 实测（21 token prefill，同一 prompt / 同一份 GGUF）
 
@@ -152,6 +163,13 @@ bash tests/run_p2.sh             # ⓿ KV 映射（不需要模型）① KV 自�
 `rpg::ArgMax` 但 `qwen3.h` 不转出 `kernels.h`；**nvcc 不接受 `void*` → `const float*`
 的隐式转换**（g++ 接受，所以这是平台差异）；注释里行尾的 shell 续行 `\` 触发 `-Wcomment`。
 
+**P3（第一步）一次编过，没有新坑** —— 不是运气：上面那些都写进了设计文档与文件头注释，
+写新代码时是照着它们绕开的。**坑清单的价值就在于把"每次重新踩一遍"换成"照着单子绕开"。**
+唯一需要记的是两个"设计上就避开"的陷阱（不是踩到才发现的），见
+[设计文档 §8 的 P3 一节](docs/DESIGN.md)：两级二分的上中点必须用 `uint64` 算
+（`hi - lo + 1` 在 `lo=0 / hi=0xFFFFFFFF` 时溢出成 0 ⇒ 死循环），以及逆变换的
+求和顺序本身就是判据的一部分（并行扫描会与 CPU 选到不同的 token）。
+
 ## 用起来
 
 产物是 `rpg_engine.dll` / `librpg_engine.so`，与 CPU 版**同名同 ABI**。
@@ -169,14 +187,20 @@ src/                    ← host 层：ABI、GGUF、分词器、ChatML、工具�
                           + CUDA 计算层（重写）：gpu_model.cu（权重上卡）
                             / kv_cache_gpu.cu（fp16 KV Cache）/ kernels_gpu.cu（算子）
                             / qwen3_gpu.cu（前向 + 增量解码 + 贪心）
+                            / sampler_gpu.cu（采样：T / top_k / top_p + 随机源）
+                          ← 另有 sampler.h：**逐字复制**的同源副本（采样参数的语义是契约）
 docs/DESIGN.md          ← 设计决策、阶段判据、对拍策略、与上位仓库的同步方式
 scripts/                ← fetch_model.py（下权重与对拍参考物）
 tests/                  ← check_sync.py（副本有没有跑偏）、abi_smoke.py（ABI 冒烟）、
                           run_p1.sh / cmp_layers.py（P1 一键判据）、
-                          run_p2.sh / cmp_gen.py（P2 一键判据）
+                          run_p2.sh / cmp_gen.py（P2 一键判据）、
+                          run_p3.sh / cmp_sample.py（P3 一键判据，不需要模型）
 tools/                  ← cuda_check / dequant_check / layer_check / gen_check
                           / kv_map_check（KV 映射，不需要模型）
-                          + build_cpu_ref.sh（现编 CPU 引擎做参考侧）
+                          / sample_check（采样，不需要模型）
+                          + build_cpu_ref.sh（现编 CPU 引擎做参考侧：
+                            forward_check / cpu_ref_gen / cpu_ref_sample）
+                          + cpu_ref_gen.cc / cpu_ref_sample.cc（只有 main，实现来自 CPU 引擎）
 ```
 
 ## 许可证

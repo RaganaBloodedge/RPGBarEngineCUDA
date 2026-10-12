@@ -63,7 +63,8 @@ char*       rpg_engine_model_info(int32_t model);
 | 权重 | `model.*` | **重写** | 权重从 mmap 变成**常驻显存**，布局也要按 kernel 重排 |
 | KV Cache | `kv_cache.*` | **重写** → `kv_cache_gpu.*` | 放到显存、fp16；**维度顺序照搬**（层 → KV 头 → 位置 → 维度）—— 见该文件头的理由 |
 | 前向 | `qwen3.*` `matmul*` `kernels.h` | **重写** | 这是全部工作量所在 |
-| 采样 | `sampler.cc` | **部分重写** | top-k/top-p 的排序在 GPU 上做（或用 `thrust`） |
+| 采样参数 | `sampler.h` | **复用** | `SampleOptions` 的字段 / 默认值 / 语义（HF 同款的 top_k 并列规则、top_p 至少留一个）是**契约**，抄成两份迟早会漂。只有头文件是副本：`sampler.cc` 依赖 CPU 侧的 `kernels.h`（`ArgMax` / `SoftmaxInplace`），搬过来等于把 CPU 前向也搬进来 —— 那是"重写"那一栏的事 |
+| 采样实现 | `sampler.cc` | **重写** → `sampler_gpu.*`，参考侧现编 | top_k 找"第 k 大值"、top_p 找"累积概率的切点"，在 GPU 上都改成**有序 key 上的二分**（CPU 那边是 `nth_element` + 全量 `sort`）；逆变换**刻意串行**（求和顺序决定选出的 token，见 §8 的 P3 一节）。参考侧仍由 `tools/build_cpu_ref.sh` 现编 `sampler.cc` |
 | ABI 层 | `engine.cc` | **重写** | 句柄表、会话管理、JSON 编解码保持形状，但内部对象换成 GPU 侧 |
 | 判据工具 | `tools/npy.h` `tools/cli_util.h` | **复用** | npy 布局与"命令行读文件"的写法必须两边一样，否则对拍脚本的报错会误导 |
 
@@ -133,7 +134,7 @@ decode 阶段每层要发十几个小 kernel（norm / QKV / rope / attention / O
 | **P0** 工具链与骨架 | CMake + CUDA，ABI 层最小实现（version / last_error / load_model / model_info） | 见下面「P0 的判据」 |
 | **P1** 权重上卡 + 前向对拍 | 权重与反量化结果上显存；**整网（无 KV Cache）前向**跑通 | 见下面「P1 的判据」 |
 | **P2** 增量解码对拍 | KV Cache 落地（fp16）、增量解码、贪心采样 | 见下面「P2 的判据」 |
-| **P3** 接入与端到端 | 采样参数、工具调用、`rpg_engine.dll` 换进 RPGBar | `engine_probe.py`、`smoke_test.py`、Unity 侧 P/Invoke 全绿 |
+| **P3** 接入与端到端 | 采样参数（**已完成第一步：设备端采样 + 判据**）、工具调用、`rpg_engine.dll` 换进 RPGBar | 采样判据见下面「P3 的判据」；端到端是 `engine_probe.py`、`smoke_test.py`、Unity 侧 P/Invoke 全绿 |
 | **P4** 性能 | 融合 kernel、量化直算调优、CUDA Graph | 1.7B Q4 上 prefill ≥ 1000 tok/s、decode ≥ 60 tok/s |
 
 > **P1 的判据比"单层"更严，这是有意的**（2026-10-12 实施时定的）：原计划写的是"跑通一层、
@@ -249,6 +250,49 @@ python tests/cmp_gen.py ~/p2-runs/gpu ~/p2-runs/ref --tol 1e-3
 按已生成的序列逐步 `ForwardStep`，并顺带校验重放的 argmax 等于生成时的 token
 （引擎是纯函数，这条本该成立；不成立就先修引擎，别拿这份 logits 去对拍）。
 
+**P3 的判据（第一步：设备端采样）也是三条，一键跑**：
+
+```bash
+# 在 WSL 里。**不需要权重、不需要模型**，几秒跑完。
+bash tests/run_p3.sh
+
+# 拆开看（排错时用）
+~/cuda-build/sample_check --out ~/p3-runs/s --vocab 4096
+bash tools/build_cpu_ref.sh ~/cuda-build   # 参考侧：现编 CPU 引擎的 sampler.cc
+~/cuda-build/cpu_ref_sample --dir ~/p3-runs/s
+python tests/cmp_sample.py ~/p3-runs/s --tol 1e-5 --border 1e-6
+```
+
+1. **筛选**（`GpuFilterToProbs` vs `rpg::FilterToProbs`）：同一份 logits（从文件读，
+   逐位相同）⇒ 概率分布的 `max|Δ| ≤ 1e-5 × max|ref|`，且**保留集合完全相同**。
+   保留集合（哪些 token 没被 top_k / top_p 筛掉）是个**离散判断** —— 它比"数值接近"
+   更能说明问题：筛错了集合，后面采样出来的 token 一定是错的。
+2. **采样**（`GpuSampleToken` vs `rpg::SampleToken`）：同一份 logits + 同一个 seed ⇒
+   **token 逐位相同**。若出现分歧，判据要求打印该 u、参考侧的累积概率、以及
+   **u 到边界的距离**，只有 `距离 < 1e-6` 才允许存在。
+3. **随机源**（`DevCounterUniform` vs `rpg::CounterUniform`）：**逐位相同** ——
+   三行整数运算 + 乘一个 2 的幂，没有容差可讲。单独立一条是因为它是**重写**的
+   （上游在 `sampler.cc` 里），是"改一边忘另一边"最容易发生的地方。
+
+> ⚠️ **"采样不能逐 token 对拍"（§6 第 10 条）说的是"接在模型后面"的采样。**
+> 那一层确实只能退成统计判据：两边 logits 先差了 fp16 的舍入，采样再把差异放大成
+> "整段序列不同"。但**把模型摘掉**之后判据立刻回来 —— 两边喂同一份从文件来的
+> logits，`FilterToProbs` / `SampleToken` / `CounterUniform` 全是纯函数。
+> 这与下面 `kv_map_check` 把"cache 布局"与"fp16 精度"分开是同一个套路：
+> **先把变量的个数降到 1，再判**；顺序反了只会得到一个永远查不清的混合指标。
+>
+> 一个推论：`tools/sample_check` 因此**不需要权重、不需要模型**，几秒跑完 ——
+> 它是 P3 里唯一能反复跑的一条。
+>
+> 另：`temperature <= 0` 是贪心，**不消耗随机数**（`SampleToken` 直接 `ArgMax`）。
+> 这条被单独断言了两次（GPU 工具内部一次、`cmp_sample.py` 一次）：因为它是
+> "不传 temperature 的老路径逐位不变"这个向后兼容承诺的全部内容。
+
+实测（2026-10-12，WSL + CUDA 13.2 + RTX 5060 Laptop）：词表 **4096** 与 **151936**
+各跑一遍 —— u 表 **192/192 位模式相同**；概率满量程误差最大 **2.31e-7 / 1.66e-7**
+（判据 1e-5）且保留集合一致；**192/192 个 token 逐位相同**。151936 那一遍专门用来验
+二分搜索在**整个 uint32 key 空间**上收敛（小词表测不出"中点溢出"那类 bug）。
+
 ### 性能目标（RTX 5060 Laptop，8 GB，sm_120）
 
 | 指标 | CPU 版实测 | GPU 目标 |
@@ -284,12 +328,26 @@ python tests/cmp_gen.py ~/p2-runs/gpu ~/p2-runs/ref --tol 1e-3
 9. ✅ **argmax**（`GpuArgMax`）：设备端归约，只回传 4 个字节；**并列取最小下标**
    （与 CPU 版 `ArgMax` 的 `x[i] > bv` 同语义 —— 差一个并列规则就会让"逐 token
    一致"的判据红，而那种红会被误读成"数值精度不够"）。
-10. ⏳ **采样**（P3）：temperature / top-k / top-p（softmax 在 GPU 上做，选出 token
-    再回传一个 int）。**P2 只做贪心** —— 那不是"采样还没写"，是**只做能对拍的那一半**：
-    `T=0` 时分布退化成尖刺，可以逐 token 与 CPU 版比；采样不是。
+10. 🔶 **采样**（P3）：temperature / top-k / top-p + counter-based 随机源。
+    **设备端实现与判据已完成**（`src/sampler_gpu.*` + `tools/sample_check.cu`，
+    判据见 §5 的「P3 的判据」）；还差把它接进生成循环与 ABI。
+    两条筛选都用"**有序 key 上的二分**"，不排序：
+    * top_k 找**第 k 大的值**（谓词 `|{key ≥ t}| ≥ k`，在 t 上单调）；
+    * top_p 找**累积概率的切点**（谓词 `Σ{p ≤ t} ≤ 1 - top_p`，同样单调）。
+    各 32 次迭代遍历一遍词表（每次一个块内归约）。CPU 版那边是
+    `nth_element` + 全量 `std::sort`（151936 个元素 —— `FilterToProbs` 11 ms 里
+    排序占 10.25 ms），这条顺手把它一起解决了。
+    逆变换**刻意串行**（一个线程、按下标顺序累加 double）：并行扫描会改掉求和顺序，
+    于是 u 落在累积概率边界上时会与 CPU 选出不同的 token —— 而"同 logits + 同 seed
+    ⇒ 同 token"正是判据本身。代价是词表 151936 时一条 ~0.5 ms 的串行链
+    （decode 一步 54 ms，占比 ~1%）；P4 想省这点可以改成"并行算分块和 + 串行定块"，
+    那时要接受"u 贴近边界时可能与 CPU 差一个 token"这个前提。
 
-> ⚠️ **`top_p` 的排序是采样里最贵的部分**。CPU 版这里还是全量 `std::sort`（151936 个元素），
-> GPU 版用 `thrust::nth_element` 或自己写的基数选择，顺手把 CPU 版那个待办一起解决。
+> ⚠️ **`top_p` 的并列是未定义的**（P3 实施时记下的）：CPU 的规则是"按概率升序累积、
+> 累积还没过阈值就剔除"，在**概率精确相等**的元素之间取决于 `std::sort` 的同值顺序；
+> GPU 的阈值法会把并列的整撮一起剔除。fp32 softmax 的输出里精确并列几乎不出现，
+> 判据的测试数据也刻意避开它（唯一的并列用例只开 `top_k` —— 那条是**良定义**的：
+> "阈值取第 k 大值、并列一起保留"，两边都必须把并列的全留下）。
 
 ## 7. 对拍策略（这一节比代码重要）
 
@@ -304,6 +362,8 @@ python tests/cmp_gen.py ~/p2-runs/gpu ~/p2-runs/ref --tol 1e-3
    参考侧代表"CPU 引擎真的在跑的那一份"，它默认是 FMA 收缩的。两条编译线不要混。
    **P2 又加了一条同性质的判据**：`kv_map_check` 的 KV 映射（值取 fp16 能精确表示的
    整数 ⇒ 往返无损 ⇒ 逐位相同）。凡是"能退化成整数/确定性问题"的环节，都该这么测。
+   **P3 的采样接着把这条思路用到了极致**：随机源（`CounterUniform`）与
+   "同一份 logits + 同一个 seed ⇒ 同一个 token"都是逐位判的（§5 的「P3 的判据」）。
 2. ✅ **单算子容差对拍**（P1 已跑通，落在 §5 的第二条判据里）：每个 kernel 与 CPU 版
    同样输入，比相对误差。
    ⚠️ 定容差前**先量目标量级的 ULP** —— CPU 版踩过这个坑：Qwen3 的残差流有
@@ -319,7 +379,13 @@ python tests/cmp_gen.py ~/p2-runs/gpu ~/p2-runs/ref --tol 1e-3
    然后看这个分歧是否在"两个 token 概率本来就接近"的合理范围内。
    ⇒ 这条判据是**两层的**：先看每步 logits 的相对误差 p99（数值层，不过就是算错了），
    再看 token（离散层，允许"伯仲之间"的那种分歧但必须逐条记录）。见 `tests/cmp_gen.py`。
-4. ⏳ **宿主层端到端**（P3）：`smoke_test.py` 全量 + `ui_check.js`，把 dll 换过去跑。
+4. ✅ **把模型摘掉之后，采样也能逐位对拍**（P3 已跑通）：见 §5 的「P3 的判据」。
+   要点是"**先把变量的个数降到 1，再判**"—— 同一个 logits 输入喂两边，纯函数
+   就该给同一个 token。`tools/sample_check` 因此**不需要模型、不需要权重**。
+   ⇒ 这条与第 3 条是互补的：第 3 条测"模型接上去之后还对不对"（只能到容差层），
+   第 4 条测"采样本身对不对"（可以到逐位）。**两条都要有**：只做第 4 条会漏掉
+   "接起来之后的形状/位置错了"，只做第 3 条会在分歧时说不清是算术还是采样。
+5. ⏳ **宿主层端到端**（P3）：`smoke_test.py` 全量 + `ui_check.js`，把 dll 换过去跑。
 
 > **判据的参考侧一律是"真的在跑的那一份"**：反量化用从 RPGBarEngine 逐字复制的
 > `quant.cc`，整网用**现场编译出来的** CPU 引擎 `forward_check`（`tools/build_cpu_ref.sh`）。
@@ -494,7 +560,39 @@ device 计算 + 搬运：1024 个 float 全部正确
    拍一个"刚好能过"的阈值。
 3. **能不用模型判的东西，就不要用模型判**。`kv_map_check` 跑起来 0.2 秒、不需要
    1 GiB 权重、失败时能直接打出 `(head, pos, dim)` 三元组 —— 比在 21 个 token 的
-   logits 里找线索便宜两个数量级。
+   logits 里找线索便宜两个数量级。**P3 的 `sample_check` 是这条纪律的第二个例子**
+   （不需要模型、几秒跑完）。
+
+### P3 实测结果（2026-10-12，第一步「设备端采样」三条判据全绿）
+
+```text
+同一份 logits（从文件读 ⇒ 逐位相同），不需要模型、不需要权重
+
+词表 4096   ：u 表 192/192 位模式相同；概率满量程误差最大 2.31e-7（判据 1e-5）
+              保留集合逐例一致；token 192/192 逐位相同
+词表 151936 ：u 表 192/192；满量程误差最大 1.66e-7；保留集合一致；
+              token 192/192 逐位相同
+（用例矩阵 12 条：贪心 / 贪心+筛选参数 / 纯分布 / T+top_k / T+top_p / 三者都开 /
+  top_k=2 / top_p=0.05 / 温度极小 / 温度极大 / 精确并列+top_k / 精确并列+贪心）
+```
+
+**P3 第一步实施时记下的两点**：
+
+1. 🔴 **两级二分的中点必须用 uint64 算**：搜索空间是 uint32 的全 key 区间，上中点
+   若写成 `lo + (hi - lo + 1) / 2`，在 `lo = 0 / hi = 0xFFFFFFFF` 时 `hi - lo + 1`
+   会溢出成 0 ⇒ 第一次迭代就 `mid == lo` ⇒ **死循环**。它是"编译通过、看着也对、
+   一跑就卡住"的那类 bug，而且**只有词表大到能覆盖半个 key 空间时才可能踩到**
+   —— 所以判据刻意跑了一遍真实词表 151936（小词表测不出来）。
+2. **逆变换的求和顺序是判据的一部分**（理由见 §6 第 10 条）：并行扫描更快，但它改掉了
+   `cum += (double)probs[i]` 的顺序，于是 u 贴近边界时会与 CPU 选到不同的 token。
+   先按串行实现（词表 151936 时 ~0.5 ms），把"与 CPU 逐位一致"这件事做实；提速是
+   P4 的事，而且提速时要**显式承认**"u 贴近边界时可能差一个 token"这个前提。
+
+> 顺带一个观察：**这一步一次编译通过，没有新的"编得过但错了"的坑**。
+> 不是运气 —— 前两个阶段抓到的那些（`CMAKE_CUDA_STANDARD` 默认 17、`-O2` 落到
+> nvcc 上悄悄降档、CUDA 头不能 include 进 namespace、nvcc 不接受 `void*` 隐式转换、
+> 注释行尾的 `\`）都写在 §8 与文件头注释里，写新代码时是照着它们写的。
+> **坑清单的价值就在这里：它把"每次重新踩一遍"换成"照着单子绕开"。**
 
 ## 9. 已知风险
 
