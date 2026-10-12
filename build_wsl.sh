@@ -58,7 +58,7 @@ cmake --build "$BUILD" -j"$JOBS"
 echo "--- 产物 ---"
 ls -la "$BUILD"/librpg_engine.so "$BUILD"/cuda_check "$BUILD"/dequant_check \
        "$BUILD"/layer_check "$BUILD"/kv_map_check "$BUILD"/gen_check \
-       "$BUILD"/sample_check 2>/dev/null \
+       "$BUILD"/sample_check "$BUILD"/gen_sample_check 2>/dev/null \
   || ls -la "$BUILD" | grep -E "\.so$|_check$" || true
 echo
 echo "下一步（P0 第二档判据）："
@@ -73,3 +73,6 @@ echo "  bash tests/run_p2.sh"
 echo
 echo "P3 的一键判据（设备端采样：T / top_k / top_p + 随机源，不需要权重）："
 echo "  bash tests/run_p3.sh"
+echo
+echo "P3 的生成循环判据（采样接进 decode 之后的不变量，需要权重）："
+echo "  bash tests/run_p3_gen.sh"

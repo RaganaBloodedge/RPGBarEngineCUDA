@@ -187,4 +187,10 @@ if(RPG_HAS_CUDA)
   # （理由见 tools/sample_check.cu 的头注释与 DESIGN §7）。参考侧是
   # tools/cpu_ref_sample.cc，由 build_cpu_ref.sh 从 CPU 引擎的 sampler.cc 现编。
   rpg_add_tool(sample_check tools/sample_check.cu)
+  # P3 判据之二：采样**接进生成循环之后**的不变量（可复现 / 换 seed 会变 /
+  # top_k=1 退化成 argmax / counter 用绝对位置）。这一条**要模型、要权重** ——
+  # 与上面那条分工明确：那边验"采样本身"，这边验"接起来之后还讲不讲道理"。
+  # ⚠️ 这里刻意**不**与 CPU 版逐 token 对拍：接在模型后面的采样两边先差了 fp16
+  # 的舍入，硬对拍只会得到一个查不清的混合指标（DESIGN §6 第 10 条）。
+  rpg_add_tool(gen_sample_check tools/gen_sample_check.cu)
 endif()
