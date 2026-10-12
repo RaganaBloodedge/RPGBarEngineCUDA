@@ -53,6 +53,11 @@ REUSED_SRC = [
     "json.h", "json.cc", "common.h", "common.cc", "dtypes.h",
     # 反量化（host 侧复用；GPU 侧另有实现）
     "quant.h", "quant.cc",
+    # 采样参数的**定义**（SampleOptions 的字段/默认值/语义是契约）。
+    # ⚠️ 只有头文件是副本：sampler.cc 依赖 CPU 侧的 kernels.h（ArgMax / SoftmaxInplace），
+    # 搬过来等于把 CPU 前向也搬进来 —— 那是 §3 明确要"重写"的一栏。
+    # 设备端实现在 src/sampler_gpu.*，参考侧由 tools/build_cpu_ref.sh 现编 sampler.cc。
+    "sampler.h",
 ]
 
 # 这两个是 ABI 契约，两边必须逐字相同（docs/DESIGN.md §2）。

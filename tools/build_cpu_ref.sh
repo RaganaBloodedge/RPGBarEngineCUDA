@@ -2,9 +2,11 @@
 #
 # 用 **CPU 引擎（RPGBarEngine）自己的源码** 编出对拍参考侧：
 #
-#   forward_check  —— P1 用。直接编 RPGBarEngine/tools/forward_check.cc（原样）
-#   cpu_ref_gen    —— P2 用。编本仓库的 tools/cpu_ref_gen.cc，但**链接的仍然是
-#                     CPU 引擎的源码**
+#   forward_check   —— P1 用。直接编 RPGBarEngine/tools/forward_check.cc（原样）
+#   cpu_ref_gen     —— P2 用。编本仓库的 tools/cpu_ref_gen.cc，但**链接的仍然是
+#                      CPU 引擎的源码**
+#   cpu_ref_sample  —— P3 用。同上，参考侧 = CPU 引擎的 sampler.cc
+#                      （FilterToProbs / SampleToken / CounterUniform）
 #
 # ## 为什么不把 CPU 前向抄进本仓库
 #
@@ -36,7 +38,7 @@
 #   bash tools/build_cpu_ref.sh [输出目录]
 #   RPG_CPU_ENGINE_DIR=/path/to/RPGBarEngine bash tools/build_cpu_ref.sh
 #
-# 产物：<输出目录>/forward_check、<输出目录>/cpu_ref_gen
+# 产物：<输出目录>/forward_check、<输出目录>/cpu_ref_gen、<输出目录>/cpu_ref_sample
 #
 set -euo pipefail
 
@@ -63,7 +65,7 @@ OBJDIR="$OUT/cpu-ref-obj"
 mkdir -p "$OBJDIR"
 
 echo "CPU 引擎源码：$SRC"
-echo "输出：$OUT/forward_check、$OUT/cpu_ref_gen"
+echo "输出：$OUT/forward_check、$OUT/cpu_ref_gen、$OUT/cpu_ref_sample"
 echo "编译器：$($CXX --version | head -1)"
 
 INCLUDES="-I$SRC/include -I$SRC/src -I$SRC/tools"
@@ -81,7 +83,7 @@ else
   echo "  (编译器不支持 -mavx2 -mfma，AVX2 内核退化为标量)"
 fi
 
-echo "[1/3] 编译 CPU 引擎源码..."
+echo "[1/4] 编译 CPU 引擎源码..."
 OBJS=""
 for f in "$SRC"/src/*.cc; do
   b="$(basename "${f%.cc}")"
@@ -94,13 +96,19 @@ done
 
 # 先链 .new 再 mv -f：与两边仓库的构建脚本同一个环境对策（直接覆盖已存在
 # 的产物在某些沙箱下会静默失败）。
-echo "[2/3] 链接 forward_check（RPGBarEngine 自己的 main）..."
+echo "[2/4] 链接 forward_check（RPGBarEngine 自己的 main）..."
 "$CXX" $CXXFLAGS -o "$OUT/forward_check.new" "$SRC/tools/forward_check.cc" $OBJS -pthread
 mv -f "$OUT/forward_check.new" "$OUT/forward_check"
 
-echo "[3/3] 链接 cpu_ref_gen（本仓库的 main + CPU 引擎的实现）..."
+echo "[3/4] 链接 cpu_ref_gen（本仓库的 main + CPU 引擎的实现）..."
 "$CXX" $CXXFLAGS -o "$OUT/cpu_ref_gen.new" "$HERE/cpu_ref_gen.cc" $OBJS -pthread
 mv -f "$OUT/cpu_ref_gen.new" "$OUT/cpu_ref_gen"
 
-ls -la "$OUT/forward_check" "$OUT/cpu_ref_gen"
+# P3：采样判据的参考侧。它调的是 CPU 引擎的 sampler.cc —— 那几个函数
+# （FilterToProbs / SampleToken / CounterUniform）就在上面那批 .o 里。
+echo "[4/4] 链接 cpu_ref_sample（本仓库的 main + CPU 引擎的 sampler.cc）..."
+"$CXX" $CXXFLAGS -o "$OUT/cpu_ref_sample.new" "$HERE/cpu_ref_sample.cc" $OBJS -pthread
+mv -f "$OUT/cpu_ref_sample.new" "$OUT/cpu_ref_sample"
+
+ls -la "$OUT/forward_check" "$OUT/cpu_ref_gen" "$OUT/cpu_ref_sample"
 echo "OK"
