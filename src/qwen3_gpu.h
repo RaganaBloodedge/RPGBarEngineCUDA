@@ -40,6 +40,9 @@
 #include "gpu_model.h"
 #include "kv_cache_gpu.h"
 #include "model_meta.h"
+// SampleOptions（同源副本，DESIGN §3）。**必须在 namespace rpg 之外 include** ——
+// sampler.h 自带 `namespace rpg`，嵌进来会变成 `rpg::rpg::SampleOptions`。
+#include "sampler.h"
 
 namespace rpg {
 
@@ -124,25 +127,47 @@ struct GpuGenerateOptions {
   // 命中任一 id 即停。停止 token 本身**计入**返回序列（与 CPU 版
   // GenerateOptions 一致 —— 它也会把 eos 放进输出）。
   std::vector<int32_t> stop_ids;
-  // ⚠️ **没有 temperature / top_k / top_p**：P2 只做贪心（DESIGN §5 的阶段表里
-  // 采样参数是 P3）。这不是"还没写"，是刻意不写 —— 贪心是可对拍的（T=0 下
-  // 与 CPU 版逐 token 比），采样不是。先把确定性的那条路径钉死。
-  //
+  // 采样参数。**默认 temperature = 0 ⇒ 贪心**，于是"不传采样参数的老请求"
+  // 行为逐位不变 —— 这是 P2 → P3 唯一需要守住的向后兼容承诺。
+  // 字段与默认值来自同源副本 sampler.h，不要在这里另立一套。
+  SampleOptions sample;
+  // 会话级种子（整局一次，由宿主派生）。**引擎不做随机数**：seed 与 prompt /
+  // temperature 一样只是输入（DESIGN §4 那条"随机性归属"）。temperature <= 0
+  // 时完全用不到它。
+  uint64_t seed = 0;
   // 非空时逐步收集每一步的 logits（形状 [返回的 token 数, vocab]）。**默认
   // nullptr**，此时 decode 循环里一次 607 KB 的搬运都没有；对拍工具才需要它
   // （用来在分歧处打印两边的 top-5 与两个 token 的 logit 差，DESIGN §7.3）。
   std::vector<float>* step_logits = nullptr;
 };
 
-// 贪心解码。first_logits_dev 是"下一个 token"的分布所在的**显存**地址
+// 生成。first_logits_dev 是"下一个 token"的分布所在的**显存**地址
 // （[vocab]，即 prefill 最后一个位置那行 = `s->logits` 的最后一行）。
 // 生成的 token 追加进 out_ids（不含 prompt）。
 //
-// 与 CPU 版 Generate 的两条不变量一致：
+// 与 CPU 版 Generate 一一对应（那边也是"一个 Generate + 薄包装的
+// GenerateGreedy"）。两条不变量一致：
 //   * **每个**返回的 token 都写进 cache（包括最后那个与停止 token）——
 //     代价是末尾多算一步前向，换来 `cache.len() == prompt 长度 + 返回 token 数`，
 //     调用方能直接在 cache 上续下一轮而不必 reset；
 //   * 上下文满了明确报错，不静默截断（静默停下会让人以为"模型自己讲完了"）。
+//
+// 采样时的 `counter` = **绝对位置**（`kv->len()`，即这个 token 将要落进 cache
+// 的下标），不是"本轮第几个" —— 与 CPU 版逐字一致。用绝对下标才对得上
+// "暖缓存（续写）与冷缓存（从头）拿到同一个 u"这条承诺（sampler_gpu.h）。
+//
+// ⚠️ `temperature <= 0` 时走 `GpuArgMax`（并列取最小下标）——正是 P2 那条路径
+// 用的同一个 kernel，所以**贪心的结果是逐位不变的**，`GpuGenerateGreedy` 与
+// 老调用方之间没有"变了但看起来一样"的缝。
+void GpuGenerate(const GpuModel& m, GpuKvCache* kv, GpuScratch* s,
+                 const float* first_logits_dev, const GpuGenerateOptions& opt,
+                 std::vector<int32_t>* out_ids);
+
+// 贪心解码 = `GpuGenerate` 且 `sample.temperature = 0`。
+// 与 CPU 版 `GenerateGreedy` 一样是**薄包装**而不是第二份循环：两份循环迟早
+// 会漂（今天只差一行 argmax/sample，明天就是"哪个分支忘了处理停止 token"）。
+// 保留这个入口是为了 P2 的调用方（tools/gen_check、tests/run_p2.sh）一行不改，
+// 而"贪心没变"由 run_p2.sh 的逐 token 对拍继续盯着。
 void GpuGenerateGreedy(const GpuModel& m, GpuKvCache* kv, GpuScratch* s,
                        const float* first_logits_dev,
                        const GpuGenerateOptions& opt,

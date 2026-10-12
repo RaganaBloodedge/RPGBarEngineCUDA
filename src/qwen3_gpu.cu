@@ -12,6 +12,7 @@
 #include "common.h"
 #include "kernels_gpu.h"
 #include "cuda_common.h"
+#include "sampler_gpu.h"
 
 namespace rpg {
 
@@ -243,27 +244,43 @@ void GpuForwardStep(const GpuModel& m, int32_t token, int64_t pos, GpuKvCache* k
 
 // ---------------------------------------------------------------- 生成
 
-void GpuGenerateGreedy(const GpuModel& m, GpuKvCache* kv, GpuScratch* s,
-                       const float* first_logits_dev,
-                       const GpuGenerateOptions& opt,
-                       std::vector<int32_t>* out_ids) {
+void GpuGenerate(const GpuModel& m, GpuKvCache* kv, GpuScratch* s,
+                 const float* first_logits_dev, const GpuGenerateOptions& opt,
+                 std::vector<int32_t>* out_ids) {
   const ModelMeta& c = m.config();
-  RPG_CHECK(kv != nullptr, "GpuGenerateGreedy 需要 KV Cache");
+  RPG_CHECK(kv != nullptr, "GpuGenerate 需要 KV Cache");
   RPG_CHECK(first_logits_dev != nullptr, "first_logits 为空（prefill 之后才有）");
   RPG_CHECK(opt.max_tokens > 0, "max_tokens 必须为正，给了 %d", opt.max_tokens);
   RPG_CHECK(!s->argmax_idx.empty(),
             "GpuScratch 还没 Ensure 过（先跑一次 prefill）");
+  // 贪心不消耗随机数、也不需要概率缓冲（GpuSampleToken 的那条分支只调
+  // GpuArgMax）。于是"老路径"连 probs 都不必存在 —— 这一点是刻意的：
+  // 让贪心路径对 scratch 的要求与 P2 完全一致，就少一个可能红的地方。
+  const bool greedy = !(opt.sample.temperature > 0.0f);
+  if (!greedy) {
+    RPG_CHECK(s->probs.size() >= static_cast<size_t>(c.vocab) * sizeof(float),
+              "采样的概率缓冲没备好（[%d] 个 float）—— 先跑一次 prefill",
+              c.vocab);
+  }
+  float* probs = static_cast<float*>(s->probs.data());
   int32_t* idx_dev = static_cast<int32_t*>(s->argmax_idx.data());
 
   // 每一步的 logits 都在同一个缓冲里演进：prefill 的最后一行进来，之后每次
   // GpuForwardStep 覆盖 s->logits 的第 0 行。于是**整个 decode 循环里没有一次
-  // 607 KB 的显存→内存搬运**，只有 argmax 的 4 个字节。
+  // 607 KB 的显存→内存搬运**，只有采样结果的 4 个字节。
   const float* cur = first_logits_dev;
 
   for (int32_t i = 0; i < opt.max_tokens; ++i) {
-    // 贪心 = argmax。并列取最小下标（与 CPU 版 ArgMax 同语义）——
-    // 差一个并列规则就会让"逐 token 一致"的判据红。
-    GpuArgMax(cur, c.vocab, idx_dev);
+    // 绝对位置 = 这个 token 将要落进 cache 的下标（**此刻还没写进去**），
+    // 与 CPU 版 Generate 逐字一致。用绝对下标而不是"本轮第几个"：宿主每轮
+    // 重发完整 messages 时同一段前缀的位置不变，于是暖缓存（续写）与冷缓存
+    // （从头）会拿到同一个 u —— 那正是 counter-based 随机源的用处。
+    //
+    // ⚠️ 只有一个调用点：`temperature <= 0` 时 GpuSampleToken 内部直接走
+    // `GpuArgMax`（并列取最小下标）—— 与 P2 的贪心是**同一个 kernel、
+    // 同一条路径**，所以"贪心的结果逐位不变"是由构造保证的，不是靠测出来的。
+    const uint64_t counter = static_cast<uint64_t>(kv->len());
+    GpuSampleToken(cur, c.vocab, opt.sample, opt.seed, counter, probs, idx_dev);
     int32_t next = 0;
     RPG_CUDA_CHECK(
         cudaMemcpy(&next, idx_dev, sizeof(int32_t), cudaMemcpyDeviceToHost));
@@ -305,6 +322,20 @@ void GpuGenerateGreedy(const GpuModel& m, GpuKvCache* kv, GpuScratch* s,
     cur = CF(s->logits);
     if (stop) break;
   }
+}
+
+void GpuGenerateGreedy(const GpuModel& m, GpuKvCache* kv, GpuScratch* s,
+                       const float* first_logits_dev,
+                       const GpuGenerateOptions& opt,
+                       std::vector<int32_t>* out_ids) {
+  // 与 CPU 版 GenerateGreedy 同构：**拷一份再改**，不动调用方传进来的 opt。
+  // （那边拷的理由是"参数里还有 stop_ids 之类要原样带过去"；这里一样。）
+  GpuGenerateOptions g = opt;
+  g.sample.temperature = 0.0f;  // 贪心：与 P2 的行为逐位一致
+  // top_k / top_p 留着不管 —— 贪心分支不看它们（SampleToken 直接 ArgMax）。
+  // 刻意不在这里"顺手清干净"：清掉会让人以为"top_k 在贪心时也要被尊重"，
+  // 而 CPU 版同样不清。
+  GpuGenerate(m, kv, s, first_logits_dev, g, out_ids);
 }
 
 }  // namespace rpg
