@@ -17,15 +17,19 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 | --- | --- | --- |
 | P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿 |
 | P1 | 权重上卡 + 整网前向对拍 | ✅ **完成** —— 两条判据全绿（见下） |
-| P2 | KV Cache + 增量解码 + 贪心逐 token 对拍 | **下一步** |
-| P3 | 采样 / 工具调用 / 接入 RPGBar | 未开始 |
+| P2 | KV Cache（fp16）+ 增量解码 + 贪心逐 token 对拍 | ✅ **完成** —— 三条判据全绿，**32/32 个 token 与 CPU 引擎完全一致** |
+| P3 | 采样 / 工具调用 / 接入 RPGBar | **下一步** |
 | P4 | 融合 kernel、CUDA Graph、量化直算 | 未开始 |
 
 **P1 的一句话结论**：同一份 GGUF、同一串 token，GPU 的 28 层前向与 CPU 引擎**逐层对得上**
 （残差流最差 p99 = **1.05e-4**，判据 1e-3；argmax 21/21 一致），反量化**逐位相同**（0 bit 差异）。
 GPU prefill 21 token 只用 **213.7 ms**，同一份 CPU 跑 **3081.1 ms** ⇒ **14.4×**。
-⚠️ 但这还不是"DM 一轮 2 秒"——那要求 P2 的 KV Cache 与 P3 的接入，且 prefill 目标要在长
-prompt（≥512 token）上量，见 [设计文档 §5](docs/DESIGN.md)。
+
+**P2 的一句话结论**：KV Cache 跑在显存里（fp16，@4096 是 448 MiB），增量解码 + 贪心生成
+与 CPU 引擎**逐 token 完全一致**（32/32），每步 logits 的满量程误差 **6.5e-4**（判据 1e-3，
+约 1.3 个 fp16 ULP）。KV 写入的下标映射另有一条**不需要模型**的确定性判据（逐位相同）。
+⚠️ 但 decode 只比 CPU 快 **1.5 倍** —— 瓶颈已经从"算力"变成"每步约 400 次 kernel 启动
++ 一次同步"，那是 P4 的 CUDA Graph 要解决的事（见 [设计文档 §5](docs/DESIGN.md)）。
 
 **工具链现状**：CUDA Toolkit **13.2 已装在 WSL（Ubuntu 24.04）**（`/usr/local/cuda`，
 版本与宿主 `nvidia-smi` 报的 13.2 精确对齐）。Windows 侧仍没有 nvcc / cmake / MSVC ——
@@ -81,8 +85,9 @@ python3 tests/abi_smoke.py --lib ~/cuda-build/librpg_engine.so --model models/Qw
 **P1 的两条判据**（一键，在 WSL 里跑）：
 
 ```bash
-apt install python3-numpy        # cmp_layers.py 要用（判据脚本唯一的外部依赖）
+apt install python3-numpy        # cmp_layers.py / cmp_gen.py 要用（判据脚本唯一的外部依赖）
 bash tests/run_p1.sh             # ① 反量化逐位对拍 ② 整网逐层对拍
+bash tests/run_p2.sh             # ⓿ KV 映射（不需要模型）① KV 自检 ② 逐 token 对拍
 ```
 
 分两档的理由 —— **"骨架能编、错误路径说人话"和"算力实现了没有"是两件事**，
@@ -98,6 +103,9 @@ bash tests/run_p1.sh             # ① 反量化逐位对拍 ② 整网逐层对
 | `cuda_check` | WSL + CUDA 13.2 | RTX 5060 Laptop / 算力 **12.0** / 26 SM / 显存 6.9+8.0 GiB；device 计算 + 搬运全对 |
 | **`dequant_check`**（P1 ①） | WSL + CUDA 13.2 | f16→f32 穷举 65536 值全对；反量化 131072 个元素 **0 个 bit 不同** |
 | **`tests/run_p1.sh`**（P1 ②） | WSL + CUDA 13.2 | 残差流 29 项 p99 ≤ **1.05e-4**（判据 1e-3）；logits p99 5.98e-5；argmax **21/21** 一致 |
+| **`kv_map_check`**（P2 ⓿） | WSL + CUDA 13.2 | KV 写入的下标映射：120 个元素**逐位正确**；未写入区间保持为 0（无越界） |
+| **`gen_check` 的 KV 自检**（P2 ①） | WSL + CUDA 13.2 | 满量程误差 **4.09e-4**（判据 1e-3）；逐位置 argmax **21/21** 一致 |
+| **`tests/run_p2.sh`**（P2 ②） | WSL + CUDA 13.2 | 逐 token **32/32 完全一致**；数值层满量程 6.48e-4；cache 长度不变量两侧都成立 |
 
 ### P1 实测（21 token prefill，同一 prompt / 同一份 GGUF）
 
@@ -108,21 +116,41 @@ bash tests/run_p1.sh             # ① 反量化逐位对拍 ② 整网逐层对
 | 权重上卡 | — | 4.9 s（1.03 GiB，含从 `/mnt/e` 经 9p 读盘） |
 | 显存 | — | 权重 1.03 GiB + 暂存 14.8 MB，设备剩余 5.62 GiB |
 
+### P2 实测（21 token prompt + 生成 32 个 token）
+
+| 项 | CPU（12 线程） | GPU（RTX 5060 Laptop） | 倍率 |
+| --- | --- | --- | --- |
+| prefill 21 token | 3222.1 ms（6.5 tok/s） | **228.7 ms（91.8 tok/s）** | **14.1×** |
+| decode 32 token | 2609.7 ms（12.3 tok/s） | **1728.9 ms（18.5 tok/s）** | **1.5×** |
+| KV Cache(fp16) | 896 MiB（fp32，@4096） | **448 MiB**（@256 只要 28 MiB） | — |
+
+> ⚠️ **decode 只有 1.5 倍，这个数字要留着**：decode 每步只算 1 个 token，而每步要发
+> 28 层 × 十几个 kernel ≈ **400 次启动**，外加一次 argmax 的 4 字节回传同步。
+> **瓶颈已经从"算力"换成了"启动开销 + 同步"** —— 这正是 P4 的 CUDA Graph 要解决的
+> （把几百次启动摊成一次）。P2 的任务是"把对拍做对"，这个数字是 P4 的起点。
+
 > 98 tok/s 离 P4 的 1000 tok/s 目标还远，**但现在不该优化**：21 个 token 的 GEMM 每个都是
 > `1×2048` 乘 `2048×6144`，小到吃不满 26 个 SM。P4 的目标要在 ≥512 token 上量。
 
-### ⚠️ 首次真编译（P0、P1 各一次）暴露的真问题
+### ⚠️ 首次真编译（P0 / P1 / P2 各一次）暴露的真问题
 
-下面这些**都是 host-only 构建永远看不到的**（`RPG_HAS_CUDA` 未定义时整段被 `#ifdef` 掉），
-也正是"没验过就不算"的实证。**P0 抓到 2 个、P1 抓到 4 个** —— 全部细节在
+下面这些**都是 host-only 构建永远看不到的**（`RPG_HAS_CUDA` 未定义时相关代码整段被
+`#ifdef` 掉，`tools/` 下的判据工具根本不会被创建），也正是"没验过就不算"的实证。
+**P0 抓到 2 个、P1 抓到 4 个、P2 抓到 5 个** —— 全部细节在
 [设计文档 §8](docs/DESIGN.md)，这里只列名字：
 
-P0：`cuda_common.h` 把 CUDA 头 include 进了 `namespace rpg`（报错全落在标准库内部）；
+**P0**：`cuda_common.h` 把 CUDA 头 include 进了 `namespace rpg`（报错全落在标准库内部）；
 `cuda_check` 目标漏了 `cuda_common.cc`（链接期才炸）。
 
-P1：`CMAKE_CUDA_STANDARD` 默认 17 而 `dtypes.h` 用了 `std::bit_cast`；
+**P1**：`CMAKE_CUDA_STANDARD` 默认 17 而 `dtypes.h` 用了 `std::bit_cast`；
 `add_compile_options(-O2)` 与 Release 的 CUDA `-O3` 冲突（**编译通过但悄悄降档**）；
 静态成员函数里的 lambda 捕了 `this`；两个 `.cu` 漏 include。
+
+**P2**：🔴 **`GpuForwardFull` 里 `logits == nullptr` 的早退差点写到 lm_head 之前** ——
+那样 `decode` 循环里的 logits 缓冲永远是上一轮的垃圾，**不崩，只是从第二个 token 起
+全错**；`GpuArgMax` 改了签名没改头文件里的声明；`tools/cpu_ref_gen.cc` 用了
+`rpg::ArgMax` 但 `qwen3.h` 不转出 `kernels.h`；**nvcc 不接受 `void*` → `const float*`
+的隐式转换**（g++ 接受，所以这是平台差异）；注释里行尾的 shell 续行 `\` 触发 `-Wcomment`。
 
 ## 用起来
 
@@ -138,12 +166,16 @@ python scripts/engine_probe.py     # 在 RPGBar 仓库里跑，会打印引擎�
 ```
 include/rpg_engine.h    ← 逐字复制自 RPGBarEngine，是唯一契约（两边都不许单独改）
 src/                    ← host 层：ABI、GGUF、分词器、ChatML、工具解析、元数据推导（复用/新增）
-                          + CUDA 计算层：gpu_model.cu / kernels_gpu.cu / qwen3_gpu.cu（重写）
+                          + CUDA 计算层（重写）：gpu_model.cu（权重上卡）
+                            / kv_cache_gpu.cu（fp16 KV Cache）/ kernels_gpu.cu（算子）
+                            / qwen3_gpu.cu（前向 + 增量解码 + 贪心）
 docs/DESIGN.md          ← 设计决策、阶段判据、对拍策略、与上位仓库的同步方式
 scripts/                ← fetch_model.py（下权重与对拍参考物）
 tests/                  ← check_sync.py（副本有没有跑偏）、abi_smoke.py（ABI 冒烟）、
-                          run_p1.sh（P1 一键判据）、cmp_layers.py（逐层误差统计）
-tools/                  ← cuda_check / dequant_check / layer_check
+                          run_p1.sh / cmp_layers.py（P1 一键判据）、
+                          run_p2.sh / cmp_gen.py（P2 一键判据）
+tools/                  ← cuda_check / dequant_check / layer_check / gen_check
+                          / kv_map_check（KV 映射，不需要模型）
                           + build_cpu_ref.sh（现编 CPU 引擎做参考侧）
 ```
 

@@ -98,6 +98,73 @@
 - **ABI 行为没有变化**：`generate` 仍然明确报错（文案更新为"整网生成还没实现，P1 只到
   无 KV Cache 的整网前向"），`rpg_engine.h` 一个字节未动。上卡接进 ABI 是 P2 的事。
 
+### 新增（P2：KV Cache（fp16）+ 增量解码 + 贪心对拍）
+
+- **`src/kv_cache_gpu.{h,cu}`**：显存里的 KV Cache，元素 **fp16**，维度顺序与 CPU 版
+  一个字不改（层 → KV 头 → 位置 → 维度）。@4096 上下文从 896 MiB 降到 **448 MiB**。
+- **三个新算子**（`src/kernels_gpu.{h,cu}`）：
+  - `GpuKvWrite`：本段的 `[t][head][dim]` → cache 的 `[head][pos][dim]`（**布局不同，
+    不是 memcpy**），一次 fp32→fp16；
+  - `GpuAttentionFromCache`：从 cache 读历史的因果注意力，遍历上界是**绝对位置** `pos0 + t`；
+  - `GpuArgMax`：设备端归约，只回传 4 个字节（logits 是 151936 个 float = 607 KB，
+    取一个下标却回拷它是纯浪费）；**并列取最小下标**，与 CPU 版 `ArgMax` 同语义。
+- **`src/qwen3_gpu.{h,cu}`**：`GpuForwardLayer` 加 `pos0` 与 `kv`（RoPE 用绝对位置；
+  kv 非空时先写 cache、再从 cache 读注意力）；`GpuForwardFull` 加 `kv` 参数（与 CPU 版
+  同语义：pos0 = cache 当前长度、**所有层写完后才推进 len**）；新增 `GpuForwardStep`
+  与 `GpuGenerateGreedy`。⚠️ 增量解码不是"另一份实现"—— `GpuForwardStep` 就是
+  `GpuForwardFull(seq = 1, kv)`，与 CPU 版一模一样；两条路径共用同一份 `GpuForwardLayer`
+  正是"带 cache 与不带 cache 只该差一个 fp16 舍入"这句话能成立的原因。
+- **判据工具与脚本**：
+  - `tools/kv_map_check.cu`：KV 写入的下标映射与边界。**不需要模型、不需要权重** ——
+    值取 fp16 能精确表示的整数（往返无损 ⇒ 判据是**逐位相同**），另加一条"没写过的
+    区间必须仍是 0"（越界写到邻居不报错，只会悄悄改掉它）。它把"布局错"与"精度不够"
+    彻底分开，所以放在判据脚本的最前面。
+  - `tools/gen_check.cu`：增量解码 + 贪心生成 + **KV 自检**（带 cache 的 prefill 与
+    不带 cache 的全序列前向比 logits），写 `.gen.txt` 与可选的 `.step_logits.npy`。
+  - `tools/cpu_ref_gen.cc`：**参考侧的 main**（实现在 CPU 引擎里）—— 它
+    `#include "qwen3.h"` 直接用 CPU 引擎的 `Model` / `ForwardFull` / `ForwardStep` /
+    `GenerateGreedy` / `ArgMax`，**没有一行前向或解码逻辑是抄的**。生成用引擎自己的
+    `GenerateGreedy`（那才是判据对象），每步 logits 靠"**重放**"收集，并顺带校验
+    重放的 argmax 等于生成时的 token（引擎是纯函数，这条本该成立）。
+  - `tests/cmp_gen.py`（逐 token 对拍：数值层 + token 层；分歧处打印两边 top-5 与
+    两个 token 的 logit 差）、`tests/run_p2.sh`（P2 一键判据，三条）。
+- `build_cpu_ref.sh` 增加第二个产物 `cpu_ref_gen`（同一个 `.o` 集合，**只换 main**）。
+
+### 说明（P2）
+
+- **P2 的三条判据全绿**（2026-10-12，WSL + CUDA 13.2 + RTX 5060 Laptop）：
+  - ⓿ KV 映射：写入区间 120 个元素**逐位正确**、未写入区间保持为 0；
+  - ① KV 自检：满量程误差 **4.09e-4**（判据 1e-3），逐位置 argmax **21/21** 一致；
+  - ② 逐 token 对拍：**32/32 完全一致**，数值层满量程 6.48e-4，cache 长度不变量两侧成立。
+- ⚠️ **判据口径从"逐元素相对误差 p99"换成了"绝对误差 / 满量程"**。KV 过 fp16 之后，
+  误差的**绝对**量级由舍入决定（稳定在 ~1e-2 上下），而相对误差 = 它 ÷ 元素自身的值 ——
+  于是 p99 完全由"有多少元素落在 0.5 附近"决定，换个 prompt 就从 1.7e-2 漂到 5.2e-2
+  （同一份实现、同一份权重）。新口径有物理依据：fp16 尾数 10 位 ⇒ 1 ULP = 2⁻¹¹ = 4.88e-4，
+  判据取满量程的 **1e-3**（约 2 个 ULP）。两点标定：**seq=1 → 8.97e-5（0.18 ULP）、
+  seq=21 → 5.6e-4（1.15 ULP）**，比值随长度按 **√n** 增长 —— 正是独立随机舍入误差
+  累加的标度律（布局错会是 1e0 量级且不随 n 平滑变化）。
+- **性能**（21 token prompt + 生成 32 个 token，同一份权重）：
+  prefill GPU **228.7 ms** vs CPU 3222.1 ms ⇒ **14.1×**；
+  decode GPU **1728.9 ms（18.5 tok/s）** vs CPU 2609.7 ms（12.3 tok/s）⇒ **1.5×**；
+  KV Cache(fp16)：**28 MiB @256 位置 / 448 MiB @4096**。
+  ⚠️ decode 只有 1.5 倍是**预期内**的：每步只算 1 个 token，却要发 28 层 × 十几个
+  kernel ≈ **400 次启动** + 一次 argmax 回传同步 —— 瓶颈已经从"算力"变成"启动开销
+  + 同步"，那正是 P4 的 CUDA Graph 要解决的（DESIGN §4.3）。**这个数字是 P4 的起点。**
+- **P2 首次真编译抓出 5 个问题**（host-only 构建看不到 —— 没定义 `RPG_HAS_CUDA` 时
+  `tools/` 下的判据工具根本不会被创建）。最值得记的是：`GpuForwardFull` 里
+  `logits == nullptr` 的早退**差点写在 lm_head 之前** —— 那样 decode 循环里的 logits
+  缓冲永远是上一轮的垃圾，**不崩，只是第一个 token 对、从第二个起全错**（这种形态最
+  容易被归因成"小模型生成质量差"而不是 bug）。另有：改了 `GpuArgMax` 的签名没改头文件
+  声明（报错在调用方）、`cpu_ref_gen.cc` 用了 `rpg::ArgMax` 但 `qwen3.h` 不转出
+  `kernels.h`、**nvcc 不接受 `void*` → `const float*` 的隐式转换（g++ 接受，平台差异）**、
+  注释里行尾的 shell 续行 `\` 触发 `-Wcomment`。全部修掉，教训写进 DESIGN §8。
+- **ABI 行为仍然没有变化**：`generate` 依旧明确报错（文案更新为"生成还没接进 ABI ——
+  P2 已完成整网前向 + KV Cache + 增量解码，把显存状态挂进 session 是 P3 的事"），
+  `include/rpg_engine.h` 一个字节未动。`Session` 到现在还没有显存状态，`session_reset`
+  仍是空操作（不假装清了个东西）—— 这与上面 P1 那条说明里"上卡接进 ABI 是 P2 的事"
+  的说法不同：**真做下去才发现，P2 的全部工作量在"把增量解码做对"，接 ABI 是 P3 的
+  实体**（DESIGN §5 的阶段表本来也是这么分的）。
+
 ### 说明
 
 - **P0 的两档判据全绿**（2026-10-12）。不需要显卡的那一档在 Windows 上跑

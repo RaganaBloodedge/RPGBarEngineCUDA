@@ -61,7 +61,7 @@ char*       rpg_engine_model_info(int32_t model);
 | 反量化 | `quant.*` | **复用（host 侧）** | 块缩放表的解析；GPU 侧的直算要另写 |
 | 元数据 | `model_meta.*` | **新增（从 `model.cc` 里抽出来）** | 形状/超参的推导**只留一处**：`engine.cc`（灌进 `model_info`）与 `gpu_model.cu` 都用它。见下面的警告 |
 | 权重 | `model.*` | **重写** | 权重从 mmap 变成**常驻显存**，布局也要按 kernel 重排 |
-| KV Cache | `kv_cache.*` | **重写** | 放到显存，fp16 |
+| KV Cache | `kv_cache.*` | **重写** → `kv_cache_gpu.*` | 放到显存、fp16；**维度顺序照搬**（层 → KV 头 → 位置 → 维度）—— 见该文件头的理由 |
 | 前向 | `qwen3.*` `matmul*` `kernels.h` | **重写** | 这是全部工作量所在 |
 | 采样 | `sampler.cc` | **部分重写** | top-k/top-p 的排序在 GPU 上做（或用 `thrust`） |
 | ABI 层 | `engine.cc` | **重写** | 句柄表、会话管理、JSON 编解码保持形状，但内部对象换成 GPU 侧 |
@@ -132,7 +132,7 @@ decode 阶段每层要发十几个小 kernel（norm / QKV / rope / attention / O
 | --- | --- | --- |
 | **P0** 工具链与骨架 | CMake + CUDA，ABI 层最小实现（version / last_error / load_model / model_info） | 见下面「P0 的判据」 |
 | **P1** 权重上卡 + 前向对拍 | 权重与反量化结果上显存；**整网（无 KV Cache）前向**跑通 | 见下面「P1 的判据」 |
-| **P2** 增量解码对拍 | KV Cache 落地（fp16）、增量解码、贪心采样 | `T=0` 下与 CPU 版**逐 token 比较**（允许极少分歧，分歧必须记录位置与 logits 差距） |
+| **P2** 增量解码对拍 | KV Cache 落地（fp16）、增量解码、贪心采样 | 见下面「P2 的判据」 |
 | **P3** 接入与端到端 | 采样参数、工具调用、`rpg_engine.dll` 换进 RPGBar | `engine_probe.py`、`smoke_test.py`、Unity 侧 P/Invoke 全绿 |
 | **P4** 性能 | 融合 kernel、量化直算调优、CUDA Graph | 1.7B Q4 上 prefill ≥ 1000 tok/s、decode ≥ 60 tok/s |
 
@@ -187,6 +187,68 @@ python tests/cmp_layers.py ~/p1-runs/gpu ~/p1-runs/ref --tol 1e-3
 理由与具体编译命令见 `tools/build_cpu_ref.sh` 的头注释（顺带记录了"为什么不能直接用
 RPGBarEngine 的 `build.sh`"：那是 MSYS2/MinGW 专用的）。
 
+**P2 的判据也是两条，一键跑**：
+
+```bash
+# 在 WSL 里。前置与 P1 相同（权重在 models/、numpy 已装）
+bash tests/run_p2.sh
+
+# 拆开看（排错时用）
+~/cuda-build/gen_check   models/Qwen3-1.7B-Q4_K_M.gguf --prompt-file p.txt --max-tokens 32 --out ~/p2-runs/gpu --step-logits
+bash tools/build_cpu_ref.sh ~/cuda-build   # 参考侧：现编 CPU 引擎源码 + 本仓库的 main
+~/cuda-build/cpu_ref_gen models/Qwen3-1.7B-Q4_K_M.gguf --prompt-file p.txt --max-tokens 32 --out ~/p2-runs/ref --step-logits
+python tests/cmp_gen.py ~/p2-runs/gpu ~/p2-runs/ref --tol 1e-3
+```
+
+1. **⓿ KV 映射**（`tools/kv_map_check`，**不需要模型、不需要权重**）：确证
+   `GpuKvWrite` 的下标重排（`[t][h][d]` → `[h][pos][d]`）与写入边界。值用 fp16
+   **能精确表示**的整数 ⇒ 判据是**逐位相同**，与精度完全无关；另加一条
+   "**没写过的区间必须仍是 0**"（越界写到邻居不报错，只会悄悄改掉它）。
+   **放在最前面**：映射错了的症状与"fp16 精度不够"一模一样 —— 都是"从某个位置
+   起开始胡说"，而后者是本项目明确接受的取舍（§4.2 拿 448 MiB 换的）。
+2. **① KV 自检**（`tools/gen_check` 自己做）：同一段 prompt，**带 cache 的 prefill
+   与不带 cache 的全序列前向**比 logits。判据 = **逐位置 argmax 全一致** +
+   **`max|Δ| ≤ 1e-3 × max|ref|`**（绝对误差对满量程取比值）＋ 打印逐位置 max|Δ|。
+   ⚠️ CPU 侧这条是"**逐位相同**"（K/V 都是 fp32）；GPU 侧 KV 是 fp16，逐位相同不可能。
+   **但判据也不是"逐元素相对误差的 p99"** —— 那个量在这条链路上不是能定的判据：
+   误差的绝对量级由 fp16 的舍入决定（稳定在 ~1e-2），再除以元素自身的值，于是 p99
+   完全由"有多少元素落在 0.5 上下"决定，换个 prompt 就从 1.7e-2 漂到 5.2e-2（同一份
+   实现）。改用有物理依据的**满量程比值**：fp16 尾数 10 位 ⇒ 1 ULP = 2⁻¹¹ = 4.88e-4，
+   1e-3 就是约 2 个 ULP。
+3. **② 逐 token 对拍**（`tools/gen_check` vs `tools/cpu_ref_gen` + `tests/cmp_gen.py`）：
+   两边同一 prompt、同一 `max_tokens`，`T=0` 贪心各生成一遍，逐步比 token 与 logits。
+   判据分两层：
+   * **数值层**：每步 logits 的 `max|Δ| ≤ 1e-3 × max|ref|`（口径与上面的 KV 自检一致）。
+   * **token 层**：完全一致；若有分歧，**每一处都必须记录在案**（位置、两边各自的
+     top-5、两个 token 的 logit 差），且只有"两个 token 本来就在伯仲之间"（相对差
+     ≤ 1e-2）才允许存在 —— 那正是 fp16 KV 的舍入足以推过去的情形。
+   数值层先过才有意义：数值层不过而 token 有分歧，那是算错了，不是精度。
+
+> **`1e-3` 是量出来的，不是拍的**（P2 实施时定下的）：
+>
+> | prompt 长度 | max\|Δ\| | 满量程 max\|ref\| | 比值 | 折算 fp16 ULP |
+> | --- | --- | --- | --- | --- |
+> | **1** 个位置 | 0.001526 | 17.02 | 8.97e-5 | 0.18 |
+> | **21** 个位置 | 0.0112 | 20.5 | 5.6e-4 | 1.15 |
+>
+> 两点都落在 fp16 的 ULP 量级上，且比值随长度按 **√n** 增长（21/1 → 实测 6.2 倍，
+> 理论 √21 = 4.6 倍）—— 正是"独立随机舍入误差累加"的标度律。布局错会是 1e0 量级，
+> 且不会随 n 平滑变化。
+> ⇒ **这个判据随 prompt 长度增长**：1e-3 是给几十个位置的 prompt 定的，长上下文
+> 自检要相应放宽（放宽不会漏掉布局错 —— 那是 1e0 量级的事）。`tools/gen_check`
+> 在自检失败时会直接把这条指向 `kv_map_check`。
+> 这与 CPU 引擎那次"残差流有 |h| ≈ 1.2e4 的离群维度 ⇒ 绝对误差 < 1e-4 不可能满足"
+> 是**同一个教训的第三次应验**：**定数值判据前先量目标量级的 ULP。**
+
+⚠️ **参考侧的 main 在本仓库，实现来自 CPU 引擎**。上位仓库的 `tools/gen_check`
+不导出每步 logits，而上面第 2 条要求在分歧处打印两边的 top-5 —— 修法不是改上位
+仓库（那要走它的发版流程），而是 `tools/cpu_ref_gen.cc`：它 `#include "qwen3.h"`
+直接用 CPU 引擎的 `Model` / `ForwardFull` / `ForwardStep` / `GenerateGreedy` /
+`ArgMax`，**没有一行前向或解码逻辑是抄的**。生成用引擎自己的 `GenerateGreedy`
+（那才是判据对象），每步 logits 靠"**重放**"收集：另建一份 cache、重新 prefill、
+按已生成的序列逐步 `ForwardStep`，并顺带校验重放的 argmax 等于生成时的 token
+（引擎是纯函数，这条本该成立；不成立就先修引擎，别拿这份 logits 去对拍）。
+
 ### 性能目标（RTX 5060 Laptop，8 GB，sm_120）
 
 | 指标 | CPU 版实测 | GPU 目标 |
@@ -204,14 +266,27 @@ RPGBarEngine 的 `build.sh`"：那是 MSYS2/MinGW 专用的）。
    直接拒**（`GpuModel::CheckGpuType`）—— 让不认识的量化块进 kernel，症状是"能出词但胡说"。
 2. ✅ **RMSNorm**（`out = x * rsqrt(mean(x²) + eps) * w`）
 3. ✅ **RoPE**（⚠️ **半维配对**，不是相邻配对 —— 写错不崩、只是胡说）
-4. ✅ **Attention**（`softmax(QKᵀ/√d)V`，因果掩码靠"只遍历到 t"实现）。P1 版 q/k/v 全在
-   显存里、无 cache；**从 KV Cache 读的那一版是 P2**
+4. ✅ **Attention**（`softmax(QKᵀ/√d)V`，因果掩码靠"只遍历到 t"实现）。**两条路径都在**：
+   P1 的无 cache 版（`GpuCausalAttention`：q/k/v 全在显存、只看本段）与 P2 的从
+   KV Cache 读历史版（`GpuAttentionFromCache`：遍历上界是**绝对位置** pos0 + t）。
+   两条刻意都留着 —— 它们在同一段 token 上的差异只该来自 fp16 的舍入，这条比什么
+   都好用（见 §5 的 KV 自检）。（代价是 softmax 那几十行重复了一遍，理由见
+   `kernels_gpu.cu` 里那个 kernel 的头注释：动一个已过判据的 kernel 会让 P1 的
+   结论要重证一遍。）
 5. ✅ **SwiGLU**：`silu(gate) * up`，其中 silu 用 `x / (1 + exp(-x))`
 6. ✅ **残差加 / 逐元素乘**
 7. ✅ **LM head**（`hidden × vocab^T`，词表 151936 —— 这是 decode 里最宽的一次 GEMM）。
    ⚠️ 本权重 **tied_embeddings = true**（既没有 `output.weight` 也没有 `lm_head.weight`），
    LM head 复用 `token_embd`，**不重复上传第二份**（Q4 下也省 150 MiB）
-8. ⏳ **采样**（P2）：temperature / top-k / top-p（softmax 在 GPU 上做，选出 token 再回传一个 int）
+8. ✅ **KV Cache 写入**（`GpuKvWrite`）：本段的 `[t][head][dim]` → cache 的
+   `[head][pos][dim]`，一次 fp32→fp16（`__float2half_rn`）。**两者的布局不同，
+   不是 memcpy** —— 写反了不崩，只是从某个位置起开始胡说。
+9. ✅ **argmax**（`GpuArgMax`）：设备端归约，只回传 4 个字节；**并列取最小下标**
+   （与 CPU 版 `ArgMax` 的 `x[i] > bv` 同语义 —— 差一个并列规则就会让"逐 token
+   一致"的判据红，而那种红会被误读成"数值精度不够"）。
+10. ⏳ **采样**（P3）：temperature / top-k / top-p（softmax 在 GPU 上做，选出 token
+    再回传一个 int）。**P2 只做贪心** —— 那不是"采样还没写"，是**只做能对拍的那一半**：
+    `T=0` 时分布退化成尖刺，可以逐 token 与 CPU 版比；采样不是。
 
 > ⚠️ **`top_p` 的排序是采样里最贵的部分**。CPU 版这里还是全量 `std::sort`（151936 个元素），
 > GPU 版用 `thrust::nth_element` 或自己写的基数选择，顺手把 CPU 版那个待办一起解决。
@@ -225,16 +300,25 @@ RPGBarEngine 的 `build.sh`"：那是 MSYS2/MinGW 专用的）。
    `__fmul_rn`/`__fsub_rn` 显式不做 FMA 收缩，host 侧若把 `d1 * raw - m1` 缩成 FMA，
    两边差 1 ULP，判据红一片 —— **看起来像拆包写错了，其实是编译选项**。
    （顺带：这条让两边更接近，不是更远 —— CPU 引擎在 Windows/MinGW 上不带 `-mfma`，本来也不收缩。）
+   ⚠️ 注意 `tools/build_cpu_ref.sh` **刻意不给参考侧加** `-ffp-contract=off`：
+   参考侧代表"CPU 引擎真的在跑的那一份"，它默认是 FMA 收缩的。两条编译线不要混。
+   **P2 又加了一条同性质的判据**：`kv_map_check` 的 KV 映射（值取 fp16 能精确表示的
+   整数 ⇒ 往返无损 ⇒ 逐位相同）。凡是"能退化成整数/确定性问题"的环节，都该这么测。
 2. ✅ **单算子容差对拍**（P1 已跑通，落在 §5 的第二条判据里）：每个 kernel 与 CPU 版
-   同样输入，**相对误差 p99 ≤ 1e-3**。
+   同样输入，比相对误差。
    ⚠️ 定容差前**先量目标量级的 ULP** —— CPU 版踩过这个坑：Qwen3 的残差流有
    `|h| ≈ 1.2e4` 的离群维度，float32 的 1 ULP 就有 1e-3 量级，"绝对误差 < 1e-4"
    是**不可能满足**的判据。所以判据用**相对**误差 + 分位数（p99），并设
    `REL_FLOOR = 1e-3` 跳过"绝对值本来就接近 0"的那些元素。
-3. ⏳ **端到端贪心逐 token**（P2）：`T=0` 时分布退化成尖刺，KV 的 fp16 舍入**多数情况下不改变
-   argmax**。做法：两边同一 prompt 各生成 64 token，逐 token 比；一旦分歧，**打印分歧
-   位置、两边各自的 top-5 logits**，然后看这个分歧是否在"两个 token 概率本来就接近"
-   的合理范围内。
+   ⚠️ **但同一条经验在 P2 反过来用了一次**：KV 过 fp16 之后，"逐元素相对误差的 p99"
+   又变成了一个不能定的量（原因见 §5 ② 上面的说明）—— 判据换成了**绝对误差 / 满量程**。
+   ⇒ **没有"哪种统计量永远正确"，只有"这个量的量级是多少"。**
+3. ✅ **端到端贪心逐 token**（P2 已跑通）：`T=0` 时分布退化成尖刺，KV 的 fp16 舍入
+   **多数情况下不改变 argmax**。做法：两边同一 prompt 各生成 32 token，逐 token 比；
+   一旦分歧，**打印分歧位置、两边各自的 top-5 logits、两个 token 的 logit 差**，
+   然后看这个分歧是否在"两个 token 概率本来就接近"的合理范围内。
+   ⇒ 这条判据是**两层的**：先看每步 logits 的相对误差 p99（数值层，不过就是算错了），
+   再看 token（离散层，允许"伯仲之间"的那种分歧但必须逐条记录）。见 `tests/cmp_gen.py`。
 4. ⏳ **宿主层端到端**（P3）：`smoke_test.py` 全量 + `ui_check.js`，把 dll 换过去跑。
 
 > **判据的参考侧一律是"真的在跑的那一份"**：反量化用从 RPGBarEngine 逐字复制的
@@ -250,7 +334,7 @@ RPGBarEngine 的 `build.sh`"：那是 MSYS2/MinGW 专用的）。
 | 工具链 | **CUDA Toolkit 13.2**（`nvcc` V13.2.86）—— ✅ 已装在 **WSL（Ubuntu 24.04）** 里（`apt install cuda-toolkit-13-2`，走 NVIDIA 官方 apt 源：Ubuntu 自带的 `nvidia-cuda-toolkit` 只有 12.0、**不支持 sm_120**） |
 | 编译器 | host 部分：MSVC 2022 或 g++ 13+；⚠️ **Windows 上 nvcc 只认 `cl.exe`**，而开发机没有 VS/MSVC |
 | 判据脚本 | `tests/run_p1.sh` 需要 **numpy**（`apt install python3-numpy`，实测 1.26.4）；`check_sync.py` / `abi_smoke.py` 只要标准库 |
-| 显存 | ≥ 4 GB。P1 实测（21 token）：权重 **1.03 GiB** + 前向暂存 14.8 MB，上卡后设备剩余 5.62 GiB；P2 起再加 fp16 KV |
+| 显存 | ≥ 4 GB。P1 实测（21 token）：权重 **1.03 GiB** + 前向暂存 14.8 MB，上卡后设备剩余 5.62 GiB；P2 再加 fp16 KV（**28 MiB @256 位置 / 448 MiB @4096**，见 §4.2） |
 
 ### 为什么构建放在 WSL 里做（开发机的真实约束）
 
@@ -345,6 +429,72 @@ device 计算 + 搬运：1024 个 float 全部正确
 
 ⇒ 与 P0 同一条教训的**第二次应验**：这两条都是"另一条构建路径编得过"推不出来的。
 所以判据脚本 `tests/run_p1.sh` 从第一天起就是**一键、两条一起跑**，不给人"挑着跑"的机会。
+
+**P2 首次真编译又抓出 5 个**（同一类：host-only 构建看不到 —— `RPG_HAS_CUDA` 未定义时
+`tools/` 下的判据工具根本不会被创建）：
+
+1. 🔴 **`GpuForwardFull` 里 `logits == nullptr` 的早退差点写在 lm_head 之前**。
+   增量解码走的正是这条"只要显存里的结果"的路径 —— 早退放在前面，`s->logits` 就永远是
+   上一轮的垃圾。**它不会崩**：decode 循环里 `cur = F(s->logits)` 读到的是上一次前向的
+   分布，于是**第一个 token 还是对的**（那是 prefill 留下的），从第二个起全错。
+   这种"最前面几个对、后面全错"的形态，最容易被归因成"小模型生成质量差"而不是 bug。
+   修法：在 `qwen3_gpu.cu` 里把末端归一化与 lm_head 放在早退**之前**，并在那里留一句
+   "**这个顺序是刻意的，别动**"。
+2. `GpuArgMax` 的实现改成"结果写进调用方给的显存"（为了不每步 `cudaMalloc` 4 字节，
+   也不用命名空间级的静态 `DeviceBuffer` —— 那种静态对象要到进程退出才析构，那时
+   CUDA 上下文可能已经销毁，正是 RPGBarEngine 那个"退出挂起"的来路），但**头文件里的
+   声明忘了同步**。报错在调用方：`too many arguments in function call`。
+3. `tools/cpu_ref_gen.cc` 用了 `rpg::ArgMax`，但 `qwen3.h` 不转出 `kernels.h`
+   （`qwen3.cc` 自己 include 它）⇒ `'ArgMax' is not a member of 'rpg'`。
+4. ⚠️ **nvcc 不接受 `void*` → `const float*` 的隐式转换，g++ 接受**。
+   `kv_map_check` 里把 `DeviceBuffer::data()` 直接传给 `const float*` 参数就报
+   `argument of type "void *" is incompatible with parameter of type "const float *"`。
+   **这是平台差异，不是代码风格**：同一行在 host 编得过、在 `.cu` 里编不过。
+5. 注释里行尾的 shell 续行符 `\` 会让 GCC 认为注释续到下一行（`-Wcomment`）。
+
+⇒ 第三次应验同一条教训。**这就是判据脚本必须"一键、全跑"的原因** —— 这些错误
+没有一个能靠"另一条路径编得过"推出来，也没有一个值得靠肉眼审查发现。
+
+### P2 实测结果（2026-10-12，三条判据全绿）
+
+```
+⓿ KV 映射（不需要模型，纯确定性）
+   写入区间内 120 个元素**逐位正确**（K 与 V 分别核对）
+   未写入的位置保持为 0 —— 没有越界写到邻居
+
+① KV 自检（21 token prefill）
+   max|Δ| = 0.01117，满量程 max|ref| = 27.27 ⇒ 比值 4.09e-4（判据 1e-3）
+   逐位置 argmax：21/21 一致
+
+② 逐 token 对拍（32 个 token，T=0 贪心，同一 prompt、同一份 GGUF）
+   数值层：满量程比值 6.48e-4（判据 1e-3）
+   token 层：**32/32 完全一致**
+   cache 长度不变量 cache.len() == prompt + 生成数：两侧都 OK
+   （参考侧重放复核：32 步全部复现 ⇒ 引擎的纯函数性成立）
+
+性能（同一 prompt）
+   prefill 21 token：GPU 228.7 ms（91.8 tok/s）   CPU 3222.1 ms（6.5 tok/s）⇒ 14.1x
+   decode  32 token：GPU 1728.9 ms（18.5 tok/s）  CPU 2609.7 ms（12.3 tok/s）⇒ 1.5x
+   KV Cache(fp16) @256 位置 = 28.0 MiB；@4096 = 448 MiB
+```
+
+> ⚠️ **decode 只快 1.5 倍 —— 这个数字要留着**。decode 每步只算 1 个 token（GEMM 是
+> `1×2048` 乘 `2048×6144`，26 个 SM 几乎全空），而每步要发 28 层 × 十几个 kernel
+> ≈ **400 次 kernel 启动**，外加一次 argmax 的 4 字节回传同步。**瓶颈已经从"算力"
+> 换成了"启动开销 + 同步"** —— 这正是 §4.3 说的"P4 用 CUDA Graph 把整段 decode
+> 录成图"要解决的问题（把几百次启动摊成一次）。现在不去优化它：P2 的任务是
+> **把对拍做对**，而这个数字是 P4 的起点。
+
+**P2 实施时定下的三条判据纪律**：
+
+1. **⓿ 映射先于 ① 精度**。`kv_map_check` 不需要模型、值用 fp16 能精确表示的整数
+   （判据逐位相同），所以它把"布局"与"精度"彻底分开。顺序反了的话，一次
+   fp16 的正常偏差会被当成布局 bug 去查，而布局 bug 会被当成"fp16 就是这样"。
+2. **判据的量级要从目标精度推导**（见 §5 里那张两点标定的表），不是照着实测数字
+   拍一个"刚好能过"的阈值。
+3. **能不用模型判的东西，就不要用模型判**。`kv_map_check` 跑起来 0.2 秒、不需要
+   1 GiB 权重、失败时能直接打出 `(head, pos, dim)` 三元组 —— 比在 21 个 token 的
+   logits 里找线索便宜两个数量级。
 
 ## 9. 已知风险
 
