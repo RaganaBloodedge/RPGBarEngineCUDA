@@ -34,6 +34,7 @@
 #include "cuda_common.h"
 #include "gguf.h"
 #include "json.h"
+#include "model_meta.h"
 
 namespace {
 
@@ -53,7 +54,9 @@ constexpr float kMaxTemperature = 2.0f;
 struct Session {
   int32_t model = -1;
 
-  // P0：只有配置。P1 起这里会挂上显存的 KV Cache 与中间张量。
+  // P1：前向本身已经实现并逐层对拍过，但**验证走 tools/layer_check**，
+  // ABI 侧还没有挂上任何显存状态。P2 把 KV Cache 与上卡接进来之后，这里才会有
+  // 显存句柄；在那之前 reset 保持空操作（不假装清了个东西）。
   int32_t max_tokens = kDefaultMaxTokens;
   std::vector<std::string> stop;
   float temperature = 0.0f;
@@ -64,22 +67,13 @@ struct Session {
 struct ModelEntry {
   rpg::GgufFile gguf;
 
-  // 从 GGUF 元数据读出来的形状（供 model_info 用，P1 起用于分配显存）。
-  std::string arch;
-  std::string name;
-  int32_t n_layers = 0;
-  int32_t hidden = 0;
-  int32_t n_heads = 0;
-  int32_t n_kv_heads = 0;
-  int32_t head_dim = 0;
-  int32_t intermediate = 0;
-  int32_t vocab = 0;
-  int32_t context_length = 0;
-  int32_t max_pos = 0;          // RoPE 表覆盖的位置数（已按 context_length 截过）
-  int32_t default_max_seq = 0;  // 新建会话时的 KV Cache 容量
-  float rope_theta = 10000.0f;
-  bool tied_embeddings = false;
-  int64_t weight_bytes = 0;
+  // 形状与超参：**由 ReadModelMeta 统一推导**（src/model_meta.h 里写了为什么
+  // 只留一处 —— 两处推导 head_dim 这类字段会静默算错）。
+  rpg::ModelMeta meta;
+
+  // RoPE 表覆盖的位置数（已按 context_length 截过）、新建会话的 KV 容量。
+  int32_t max_pos = 0;
+  int32_t default_max_seq = 0;
 
   std::vector<int32_t> sessions;  // 便于 unload 时级联销毁
 };
@@ -173,62 +167,22 @@ int32_t rpg_engine_load_model(const char* model_path, const char* config_json) {
     RPG_CHECK(entry->gguf.valid(), "GGUF 打不开：%s", model_path);
 
     const rpg::GgufFile& g = entry->gguf;
-    entry->arch = g.architecture();
-    entry->name = g.MetaStr("general.name", g.MetaStr("general.basename", "(无名)"));
-    entry->n_layers = static_cast<int32_t>(g.ArchInt("block_count", 0));
-    entry->hidden = static_cast<int32_t>(g.ArchInt("embedding_length", 0));
-    entry->n_heads = static_cast<int32_t>(g.ArchInt("attention.head_count", 0));
-    entry->n_kv_heads = static_cast<int32_t>(
-        g.ArchInt("attention.head_count_kv", entry->n_heads));
-    entry->intermediate = static_cast<int32_t>(g.ArchInt("feed_forward_length", 0));
-    entry->context_length = static_cast<int32_t>(g.ArchInt("context_length", 4096));
-    entry->rope_theta = g.ArchFloat("rope.freq_base", 10000.0f);
+    // 形状/超参只在这里推一次（见 model_meta.h）。
+    entry->meta = rpg::ReadModelMeta(g);
+    const rpg::ModelMeta& mm = entry->meta;
 
-    // head_dim 只能读 key_length。**不可以**退化成 hidden / n_heads：Qwen3 两者
-    // 恰好相等，掩掉了这个错误，换个模型（Qwen2.5 的 1.5B）就错。CPU 版注释里
-    // 记的这条同样适用于这里。
-    const int64_t key_len = g.ArchInt("attention.key_length", 0);
-    if (key_len > 0) {
-      entry->head_dim = static_cast<int32_t>(key_len);
-    } else {
-      RPG_CHECK(entry->n_heads > 0 && entry->hidden % entry->n_heads == 0,
-                "缺 attention.key_length 且 %d 不被 %d 整除，无法推 head_dim",
-                entry->hidden, entry->n_heads);
-      entry->head_dim = entry->hidden / entry->n_heads;
-    }
-
-    // 词表大小取 embedding 的行数 —— 不去解析 tokenizer.ggml.tokens 那个大数组，
-    // 那一份留给分词器（P1 会构造 Tokenizer，它自己会读）。
-    const rpg::GgufTensor* emb = g.Find("token_embd.weight");
-    entry->vocab = emb != nullptr ? static_cast<int32_t>(emb->rows()) : 0;
-
-    RPG_CHECK(entry->n_layers > 0 && entry->hidden > 0 && entry->n_heads > 0 &&
-                  entry->n_kv_heads > 0 && entry->head_dim > 0 &&
-                  entry->intermediate > 0 && entry->vocab > 0,
-              "GGUF 元数据不全：layers=%d hidden=%d heads=%d kv=%d head_dim=%d "
-              "ffn=%d vocab=%d",
-              entry->n_layers, entry->hidden, entry->n_heads, entry->n_kv_heads,
-              entry->head_dim, entry->intermediate, entry->vocab);
-
-    // 权重总字节数（诊断用；P1 起这是"要往显存里搬多少"）。
-    for (const rpg::GgufTensor& t : g.tensors()) entry->weight_bytes += t.n_bytes;
-
-    // lm_head 与 embedding 是否共享。tied 时**不重复上传** —— 1.7B 的 embedding
-    // 是 151936×2048，Q4 下也有 150 MiB，白扔一份没意义。
-    entry->tied_embeddings = g.Find("lm_head.weight") == nullptr;
-
-    // 上下文长度：配置可覆盖，且不能超过 RoPE 表覆盖的范围。
-    int32_t ctx = entry->context_length;
+    // 上下文长度：配置可覆盖，且不能超过 GGUF 里声明的 context_length。
+    int32_t ctx = mm.context_length;
     if (cfg.Has("context")) ctx = static_cast<int32_t>(cfg["context"].AsInt(ctx));
-    if (ctx > entry->context_length) ctx = entry->context_length;
-    if (ctx <= 0) ctx = entry->context_length;
+    if (ctx > mm.context_length) ctx = mm.context_length;
+    if (ctx <= 0) ctx = mm.context_length;
     entry->max_pos = ctx;
     entry->default_max_seq = ctx;
 
     RPG_LOG_INFO("已加载 %s（%d 层 / hidden %d / %d 头 / %d KV 头 / 词表 %d / "
-                 "位置 %d）—— 权重尚未上传显存（P1）",
-                 entry->name.c_str(), entry->n_layers, entry->hidden,
-                 entry->n_heads, entry->n_kv_heads, entry->vocab, entry->max_pos);
+                 "位置 %d）—— 只读元数据，权重未上传显存（上卡在 P2 接进 ABI）",
+                 mm.name.c_str(), mm.n_layers, mm.hidden, mm.n_heads,
+                 mm.n_kv_heads, mm.vocab, entry->max_pos);
 
     const rpg::DeviceInfo dev = rpg::QueryDevice(0);
     if (!dev.available) {
@@ -347,12 +301,13 @@ char* rpg_engine_generate(int32_t session, const char* request_json) {
     Session* s = RequireSession(session);
     (void)s;
     (void)request_json;
-    // P0 到这里为止。**明确报错，不返回假文本。**
+    // ABI 到这里为止。**明确报错，不返回假文本。**
 #ifdef RPG_HAS_CUDA
     rpg::Throw(
-        "CUDA 后端的前向还没实现（P0 骨架阶段）。当前产物编入了 CUDA 支持，"
-        "但 rpg_engine_generate 还是空的 —— 请暂时用 RPGBarEngine 的 CPU 版。"
-        "进度见 docs/DESIGN.md 的阶段表。");
+        "CUDA 后端的整网生成还没实现（P1 只做到「无 KV Cache 的整网前向」，"
+        "逐层对拍已过 —— 见 docs/DESIGN.md §5 的阶段表）。"
+        "当前产物编入了 CUDA 支持，但 rpg_engine_generate 还是空的，"
+        "请暂时用 RPGBarEngine 的 CPU 版。");
 #else
     rpg::Throw(
         "本产物**未编译 CUDA 后端**（构建时没检测到 nvcc），因此没有前向实现。"
@@ -380,22 +335,22 @@ char* rpg_engine_model_info(int32_t model) {
 #endif
     // 下面这些键名与 CPU 版**逐字对齐** —— 宿主（engine_probe.py / Unity 侧）
     // 已经按它们取值，换实现不该让宿主改代码。
-    o.Set("arch", m->arch);
-    o.Set("name", m->name);
-    o.Set("n_layers", static_cast<int64_t>(m->n_layers));
-    o.Set("hidden", static_cast<int64_t>(m->hidden));
-    o.Set("n_heads", static_cast<int64_t>(m->n_heads));
-    o.Set("n_kv_heads", static_cast<int64_t>(m->n_kv_heads));
-    o.Set("head_dim", static_cast<int64_t>(m->head_dim));
-    o.Set("intermediate", static_cast<int64_t>(m->intermediate));
-    o.Set("vocab", static_cast<int64_t>(m->vocab));
-    o.Set("context_length", static_cast<int64_t>(m->context_length));
-    o.Set("rope_theta", static_cast<double>(m->rope_theta));
-    o.Set("tied_embeddings", m->tied_embeddings);
+    o.Set("arch", m->meta.arch);
+    o.Set("name", m->meta.name);
+    o.Set("n_layers", static_cast<int64_t>(m->meta.n_layers));
+    o.Set("hidden", static_cast<int64_t>(m->meta.hidden));
+    o.Set("n_heads", static_cast<int64_t>(m->meta.n_heads));
+    o.Set("n_kv_heads", static_cast<int64_t>(m->meta.n_kv_heads));
+    o.Set("head_dim", static_cast<int64_t>(m->meta.head_dim));
+    o.Set("intermediate", static_cast<int64_t>(m->meta.intermediate));
+    o.Set("vocab", static_cast<int64_t>(m->meta.vocab));
+    o.Set("context_length", static_cast<int64_t>(m->meta.context_length));
+    o.Set("rope_theta", static_cast<double>(m->meta.rope_theta));
+    o.Set("tied_embeddings", m->meta.tied_embeddings);
     o.Set("path", m->gguf.path());
     o.Set("max_pos", static_cast<int64_t>(m->max_pos));
     o.Set("default_max_seq", static_cast<int64_t>(m->default_max_seq));
-    o.Set("weight_bytes", m->weight_bytes);
+    o.Set("weight_bytes", m->meta.weight_bytes);
     o.Set("sessions", static_cast<int64_t>(m->sessions.size()));
     // CUDA 版**多出来**的一项：设备信息。宿主可以据此在界面上显示"跑在哪块卡上"。
     o.Set("device_available", rpg::QueryDevice(0).available);

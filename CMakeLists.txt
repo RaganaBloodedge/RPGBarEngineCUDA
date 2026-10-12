@@ -10,9 +10,14 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 if(MSVC)
-  add_compile_options(/O2 /utf-8)
+  # /fp:precise 关掉浮点收缩 —— 与下面的 -ffp-contract=off 同一个目的（见注释）。
+  add_compile_options(/O2 /utf-8 /fp:precise)
 else()
-  add_compile_options(-O2 -Wall -Wextra)
+  # -O2 只给 host（CXX）。**别让它也落到 CUDA 上**：Release 下 CMake 会给
+  # nvcc 传 -O3（CMAKE_CUDA_FLAGS_RELEASE），再叠一个 -O2 会得到
+  #   "nvcc warning : incompatible redefinition for option 'optimize'"
+  # 且**实际以 -O2 生效** —— 一次"编译通过但把 CUDA 侧悄悄降档"的坑。
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O2> -Wall -Wextra)
 endif()
 
 # ------------------------------------------------------------------ CUDA
@@ -28,7 +33,12 @@ if(CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   set(RPG_HAS_CUDA ON)
   if(NOT DEFINED CMAKE_CUDA_STANDARD)
-    set(CMAKE_CUDA_STANDARD 17)
+    # C++20，与 host 侧一致 —— **不是偏好，是硬要求**：同源副本 dtypes.h 用了
+    # `std::bit_cast`，nvcc 默认给的是 C++17，会报
+    #   error: namespace "std" has no member "bit_cast"
+    # 而报错位置在**标准库**里（看起来像环境问题，实际是标准版本）。
+    # ⚠️ 同源副本一个字都不许改（DESIGN §3），所以只能在这里抬标准。
+    set(CMAKE_CUDA_STANDARD 20)
   endif()
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     # native = 按本机 GPU 定架构。⚠️ **别把这样编出来的产物发给别人** ——
@@ -53,6 +63,7 @@ endif()
 # 详见 docs/DESIGN.md §3 与 §10（同步方式）。
 set(RPG_HOST_SOURCES
   src/engine.cc
+  src/model_meta.cc
   src/common.cc
   src/json.cc
   src/quant.cc
@@ -65,25 +76,49 @@ set(RPG_HOST_SOURCES
   src/cuda_common.cc
 )
 
+# 计算层：**全部重写**（不跟上游同步，见 DESIGN §3 的复用边界表）。
 set(RPG_CUDA_SOURCES
   src/cuda_common.cu
+  src/gpu_model.cu
+  src/kernels_gpu.cu
+  src/qwen3_gpu.cu
 )
 
-add_library(rpg_engine SHARED ${RPG_HOST_SOURCES})
-target_compile_definitions(rpg_engine PRIVATE RPG_ENGINE_BUILD)
-target_include_directories(rpg_engine PUBLIC
+# ------------------------------------------------------------------ object 库
+#
+# 为什么不是"直接把源文件编进 SHARED 目标"：tools/ 下的判据工具
+# （layer_check / dequant_check）要用到引擎**内部的 C++ 符号**（rpg::GpuModel、
+# rpg::GpuForwardFull），而共享库在 Windows 上被 rpg_engine.def 限制成只导出
+# 那 10 个 C ABI 函数 —— 工具链不上。抽成 OBJECT 库之后，同一批 .o 既进共享库
+# 也进工具，两边各取所需，且**不会出现两份编译结果不一致**。
+add_library(rpg_engine_objs OBJECT ${RPG_HOST_SOURCES})
+target_compile_definitions(rpg_engine_objs PRIVATE RPG_ENGINE_BUILD)
+# -ffp-contract=off —— 这一行不是洁癖，是 P1 判据的前提：
+#   设备端的反量化（quant_gpu.cuh）用 __fmul_rn/__fsub_rn 显式不做 FMA 收缩，
+#   如果 host 侧的 quant.cc 把 `d1 * raw - m1` 缩成 FMA，两边就差 1 ULP，
+#   而"反量化逐位对拍"这条判据会红一片 —— 看起来像是拆包写错了。
+#   （顺带：CPU 引擎在 Windows/MinGW 上不带 -mfma，本来也不收缩，所以这条
+#   反而让两边更接近，而不是更远。）
+target_compile_options(rpg_engine_objs PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-ffp-contract=off>>)
+target_include_directories(rpg_engine_objs PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_include_directories(rpg_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(rpg_engine_objs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(rpg_engine_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(RPG_HAS_CUDA)
-  target_sources(rpg_engine PRIVATE ${RPG_CUDA_SOURCES})
+  target_sources(rpg_engine_objs PRIVATE ${RPG_CUDA_SOURCES})
   # host 侧代码（engine.cc）也要知道自己编没编 CUDA —— 它据此选错误文案与
   # model_info 里的 backend 字段。
-  target_compile_definitions(rpg_engine PRIVATE RPG_HAS_CUDA=1)
+  target_compile_definitions(rpg_engine_objs PRIVATE RPG_HAS_CUDA=1)
   find_package(CUDAToolkit REQUIRED)
-  target_link_libraries(rpg_engine PRIVATE CUDA::cudart)
+  target_link_libraries(rpg_engine_objs PUBLIC CUDA::cudart)
 endif()
+
+# ------------------------------------------------------------------ 共享库
+add_library(rpg_engine SHARED)
+target_link_libraries(rpg_engine PRIVATE rpg_engine_objs)
 
 if(WIN32)
   # 显式导出清单：不这么写，MinGW 会把内部 C++ 符号全导出（见 src/rpg_engine.def）。
@@ -111,21 +146,26 @@ set_target_properties(rpg_engine PROPERTIES
 )
 
 # ------------------------------------------------------------------ 工具
-if(RPG_HAS_CUDA)
-  add_executable(cuda_check
-    tools/cuda_check.cu
-    src/cuda_common.cu
-    # DescribeDevice / DeviceJson / host-only 兜底 QueryDevice 定义在这一份里
-    # （它与 CUDA 无关，两条构建路径都编）。⚠️ 少了它会链接期报
-    # "undefined reference to rpg::DescribeDevice[abi:cxx11](...)" ——
-    # .cu 里只有 CUDA 那一半，描述文本那一半在 .cc。
-    src/cuda_common.cc
-    src/common.cc
-  )
-  target_include_directories(cuda_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_compile_definitions(cuda_check PRIVATE RPG_HAS_CUDA=1)
-  find_package(CUDAToolkit REQUIRED)
-  target_link_libraries(cuda_check PRIVATE CUDA::cudart Threads::Threads)
-  set_target_properties(cuda_check PROPERTIES
+#
+# 工具都链 rpg_engine_objs（拿内部 C++ 符号），不是链共享库 —— 理由见上面
+# object 库那段。tools/ 自己也要 -Itools（npy.h / cli_util.h）。
+function(rpg_add_tool name)
+  add_executable(${name} ${ARGN})
+  target_include_directories(${name} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+  # 工具只在有 CUDA 时被创建，所以这里直接定义；少了它，gpu_model.h /
+  # qwen3_gpu.h 会整段被 #ifdef 掉，报一堆"未声明"。
+  target_compile_definitions(${name} PRIVATE RPG_HAS_CUDA=1)
+  target_link_libraries(${name} PRIVATE rpg_engine_objs Threads::Threads)
+  set_target_properties(${name} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endfunction()
+
+if(RPG_HAS_CUDA)
+  # 工具链自检：报出设备名/算力/显存 + 一次 device→host 往返。P0 第二档判据。
+  rpg_add_tool(cuda_check tools/cuda_check.cu)
+  # P1 判据之一：反量化逐位对拍 + f16→f32 穷举。
+  rpg_add_tool(dequant_check tools/dequant_check.cu)
+  # P1 判据之二：整段前向，写 npy 供与 CPU 引擎对拍。
+  rpg_add_tool(layer_check tools/layer_check.cu)
 endif()

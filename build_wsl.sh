@@ -56,8 +56,12 @@ cmake -S "$SRC" -B "$BUILD" \
 cmake --build "$BUILD" -j"$JOBS"
 
 echo "--- 产物 ---"
-ls -la "$BUILD"/rpg_engine.so "$BUILD"/cuda_check 2>/dev/null || ls -la "$BUILD" | grep -E "\.so$|cuda_check" || true
+ls -la "$BUILD"/librpg_engine.so "$BUILD"/cuda_check "$BUILD"/dequant_check \
+       "$BUILD"/layer_check 2>/dev/null || ls -la "$BUILD" | grep -E "\.so$|_check$" || true
 echo
 echo "下一步（P0 第二档判据）："
 echo "  $BUILD/cuda_check"
-echo "  python3 tests/abi_smoke.py --lib $BUILD/rpg_engine.so --model models/Qwen3-1.7B-Q4_K_M.gguf"
+echo "  python3 tests/abi_smoke.py --lib $BUILD/librpg_engine.so --model models/Qwen3-1.7B-Q4_K_M.gguf"
+echo
+echo "P1 的一键判据（会顺带编 CPU 侧参考实现）："
+echo "  bash tests/run_p1.sh"
