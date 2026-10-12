@@ -187,29 +187,65 @@ python tests/abi_smoke.py --lib build/rpg_engine.dll --model models/Qwen3-1.7B-Q
 | 项 | 要求 |
 | --- | --- |
 | GPU | 支持 CUDA 的 NVIDIA 卡；本项目开发机 = **RTX 5060 Laptop 8 GB（Blackwell，sm_120）** |
-| 驱动 | ≥ 提供 CUDA 12.8 运行时的版本（sm_120 的硬性下限） |
-| 工具链 | **CUDA Toolkit（`nvcc`）** —— ⚠️ 开发机上当前**未安装**，这是 P0 的前置条件 |
-| 编译器 | MSVC 2022 或 g++ 13+（host 部分） |
+| 驱动 | ≥ 提供 CUDA 12.8 运行时的版本（sm_120 的硬性下限）；开发机 = 595.97 / CUDA 13.2 |
+| 工具链 | **CUDA Toolkit 13.2**（`nvcc`）—— ✅ 已装在 **WSL（Ubuntu 24.04）** 里 |
+| 编译器 | host 部分：MSVC 2022 或 g++ 13+；⚠️ **Windows 上 nvcc 只认 `cl.exe`**，而开发机没有 VS/MSVC |
 | 显存 | ≥ 4 GB（1.03 GiB 权重 + 448 MiB/会话 KV + 中间张量） |
 
-> ⚠️ **尚未验证的部分（2026-10-12 建仓时）**：`CMakeLists.txt`、`tools/cuda_check.cu`、
-> `src/cuda_common.cu` 在本机**一次都没被编译过** —— 这台机器既没有 `cmake` 也没有 `nvcc`。
-> 它们是"照文档写的"，**不是"验过的"**。装完 Toolkit 的第一件事是跑一遍
-> `cmake -S . -B build && cmake --build build -j && ./build/cuda_check`，
-> **再**开始写 kernel。别把"没报错的推测"当成"已验证的结论"。
+### 为什么构建放在 WSL 里做（开发机的真实约束）
+
+| | nvcc | cmake | g++ | MSVC | GPU 直通 |
+| --- | --- | --- | --- | --- | --- |
+| Windows 侧 | ✗ | ✗ | ✓（MSYS2） | **✗（整台机器没有 VS）** | — |
+| WSL Ubuntu 24.04 | ✓ 13.2 | ✓ | ✓ | — | ✓ `/dev/dxg` + `nvidia-smi` 认卡 |
+
+⇒ 在 Windows 上编 CUDA **必须同时装 MSVC**（nvcc 不接受 g++ 当宿主编译器），
+而 WSL 只差一个 nvcc、`apt` 就能装。所以定成这样：**P0–P2 的算法验证走 WSL**
+（产物 `librpg_engine.so`），**P3 出货时再补 MSVC + Windows 版 Toolkit** 出 `.dll`。
+
+⚠️ WSL 通过 9p 访问 `E:\` 的顺序写只有 **173 MB/s**（原生 ext4 是 2.5 GB/s，差 14 倍）。
+所以：源码只留一份（`/mnt/e`，git 管着，Windows 与 WSL 看到的是同一份，不会分叉），
+**构建目录一律落 WSL 原生**（默认 `~/cuda-build`）。这就是 `build_wsl.sh` 存在的理由。
 
 ### 编译
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-# 工具链自检（不需要权重）
-./build/cuda_check
+# 在 WSL 里（脚本找不到 nvcc 会拒绝继续，并提示 host-only 路径）
+bash build_wsl.sh                       # 产物 ~/cuda-build/librpg_engine.so
+bash build_wsl.sh --clean
+~/cuda-build/cuda_check                 # 工具链自检（不需要权重）
+
+# 等价的手工步骤
+cmake -S . -B ~/cuda-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build ~/cuda-build -j
 ```
 
 `-DCMAKE_CUDA_ARCHITECTURES=native` 会按本机 GPU 定架构；跨机器分发时要显式列
-（如 `-DCMAKE_CUDA_ARCHITECTURES=86;89;120`）—— ⚠️ 但**别用 `native` 编出来的 dll 发给
+（如 `-DCMAKE_CUDA_ARCHITECTURES=86;89;120`）—— ⚠️ 但**别用 `native` 编出来的产物发给
 别人**，在别的卡上会"加载即失败"。
+
+### 首次编译的实测结果（2026-10-12，P0 两档判据全绿）
+
+```
+设备：NVIDIA GeForce RTX 5060 Laptop GPU | 算力 12.0 | 26 SM | 显存 6.9 / 8.0 GiB
+    | CUDA 驱动 13.2 / 运行时 13.2
+device 计算 + 搬运：1024 个 float 全部正确
+```
+
+**首次编译抓出两个真问题** —— 都是 host-only 构建**永远看不到**的（`RPG_HAS_CUDA`
+未定义时相关代码整段被 `#ifdef` 掉）：
+
+1. `cuda_common.h` 把 `#include <cuda_runtime.h>` 放在了 `namespace rpg {` **里面** ——
+   libstdc++ 的 `namespace std` 被嵌套成 `rpg::std`，此后该 TU 里每个 `std::` 名字都解析
+   不到，而报错点全落在标准库内部（`'vector' in namespace 'rpg::std' does not name a
+   template type`）。**修法**：include 移到 namespace 之前，并改用 `cuda_runtime_api.h`
+   （host 侧只需要 `cudaError_t` 与内存 API；完整头会带进 `__host__`/`__device__` 那套宏）。
+2. `CMakeLists.txt` 的 `cuda_check` 目标漏了 `src/cuda_common.cc` —— 链接期报
+   `undefined reference to rpg::DescribeDevice`。
+
+⇒ **通用教训**：当 `#ifdef` 把一条构建路径整段藏起来时，"另一条路径编得过"**不能**
+推出"这条路径编得过"。这就是 P0 判据必须分两档、且第二档要真跑一次的原因 ——
+别把"没报错的推测"当成"已验证的结论"。
 
 ## 9. 已知风险
 

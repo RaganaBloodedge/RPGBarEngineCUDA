@@ -115,6 +115,11 @@ if(RPG_HAS_CUDA)
   add_executable(cuda_check
     tools/cuda_check.cu
     src/cuda_common.cu
+    # DescribeDevice / DeviceJson / host-only 兜底 QueryDevice 定义在这一份里
+    # （它与 CUDA 无关，两条构建路径都编）。⚠️ 少了它会链接期报
+    # "undefined reference to rpg::DescribeDevice[abi:cxx11](...)" ——
+    # .cu 里只有 CUDA 那一半，描述文本那一半在 .cc。
+    src/cuda_common.cc
     src/common.cc
   )
   target_include_directories(cuda_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

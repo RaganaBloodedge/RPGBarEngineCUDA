@@ -14,6 +14,23 @@
 #include <cstdint>
 #include <string>
 
+#ifdef RPG_HAS_CUDA
+// ⚠️ 这个 include 必须在 `namespace rpg` **之前**，不许挪进下面去。
+// 放进去的后果：libstdc++ 的 `namespace std` 会被嵌套成 `rpg::std`，此后这个
+// TU 里每一个 `std::` 名字都解析不到，而报错点全落在标准库内部 —— 例如
+//   error: 'vector' in namespace 'rpg::std' does not name a template type
+//   error: 'is_nothrow_move_constructible' was not declared in this scope
+// 从现象反推根因极难（这两个报错看着像标准库或编译器出了问题，其实是自己的
+// 头文件把命名空间打开了）。**这个坑真踩过**：2026-10-12 在 WSL 里第一次编
+// CUDA 路径才暴露 —— Windows 的 host-only 构建因为没定义 RPG_HAS_CUDA，整段
+// 被 #ifdef 掉，所以此前一次都没被编译过（见 docs/DESIGN.md §8）。
+//
+// 用 cuda_runtime_api.h 而不是 cuda_runtime.h：host 侧（g++ 编的 .cc）只需要
+// cudaError_t 与内存 API。完整头会带进 __host__/__device__ 一整套宏，对 host
+// 编译没有收益、只有风险。真要用 kernel 的 .cu 自己 include 完整头。
+#  include <cuda_runtime_api.h>
+#endif
+
 namespace rpg {
 
 // ---------------------------------------------------------------- 设备信息
@@ -39,8 +56,6 @@ std::string DescribeDevice(const DeviceInfo& d);
 std::string DeviceJson(const DeviceInfo& d);
 
 #ifdef RPG_HAS_CUDA
-
-#include <cuda_runtime.h>
 
 [[noreturn]] void ThrowCudaError(cudaError_t err, const char* expr,
                                  const char* file, int line);

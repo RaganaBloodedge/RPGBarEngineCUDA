@@ -15,13 +15,17 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ 骨架完成，host 层已验证；`cuda_check` 待装 Toolkit |
+| P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿（见下） |
 | P1 | 权重上卡 + 单层前向对拍 | 未开始 |
 | P2 | 整网贪心生成对拍 | 未开始 |
 | P3 | 采样 / 工具调用 / 接入 RPGBar | 未开始 |
 | P4 | 融合 kernel、CUDA Graph、量化直算 | 未开始 |
 
-⚠️ **前置条件**：本机当前**没有装 CUDA Toolkit**（`nvcc` 不存在），P1 起的工作需要它。
+**工具链现状**：CUDA Toolkit **13.2 已装在 WSL（Ubuntu 24.04）**（`/usr/local/cuda`，
+版本与宿主 `nvidia-smi` 报的 13.2 精确对齐）。Windows 侧仍没有 nvcc / cmake / MSVC ——
+所以 CUDA 路径的构建走 WSL（`bash build_wsl.sh`），产物是 `librpg_engine.so`。
+要出宿主机（Windows）能加载的 `.dll`，得等 P3 时补 MSVC + Windows 版 Toolkit。
+
 没有 Toolkit 时这个仓库仍能编译（host 部分），只是 `generate` 会明确报"未编译 CUDA 后端"。
 
 ## 编译
@@ -32,6 +36,14 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ./build/cuda_check          # 工具链自检：报出设备名、算力、显存（不需要权重）
+```
+
+**在 WSL 里编 CUDA 版**（源码留在 `/mnt/e`，构建目录落 WSL 原生 ext4 —— 理由见 `build_wsl.sh` 头部）：
+
+```bash
+bash build_wsl.sh                       # 产物 ~/cuda-build/librpg_engine.so
+bash build_wsl.sh --clean               # 先清构建目录再编
+~/cuda-build/cuda_check                 # 工具链自检
 ```
 
 **没装 Toolkit / 没装 cmake**（只要一个 g++ 就能编 host 部分）：
@@ -45,26 +57,46 @@ bash build_host.sh          # 产物 build/rpg_engine.dll（host-only）
 
 ## 验证
 
+P0 的判据分两档。**不需要显卡的那档在 Windows 上跑**：
+
 ```bash
 python tests/check_sync.py      # 22 个同源副本 + 2 个 ABI 文件与上位仓库逐字节一致
 python tests/abi_smoke.py --lib build/rpg_engine.dll
 python tests/abi_smoke.py --lib build/rpg_engine.dll --model models/Qwen3-1.7B-Q4_K_M.gguf
 ```
 
-第一条不需要显卡、不需要权重，第二条与第三条不需要显卡 —— **"骨架能编、错误路径说人话"
-和"算力实现了没有"是两件事**，前者不该被显卡卡住。
+**需要显卡的那档在 WSL 里跑**：
 
-### ⚠️ 当前哪些代码还没被编译过
+```bash
+python3 tests/abi_smoke.py --lib ~/cuda-build/librpg_engine.so --model models/Qwen3-1.7B-Q4_K_M.gguf
+~/cuda-build/cuda_check
+```
 
-| 文件 | 状态 |
-| --- | --- |
-| `src/` 里 host 层的全部文件 | ✅ `build_host.sh` 编过、链接过，`abi_smoke.py` 在真实权重上跑过 |
-| `CMakeLists.txt` | ❌ **一次都没跑过** —— 本机没装 `cmake` |
-| `tools/cuda_check.cu` | ❌ 没编译过 —— 本机没装 `nvcc` |
-| `src/cuda_common.cu` | ❌ 没编译过 —— 同上 |
+分两档的理由 —— **"骨架能编、错误路径说人话"和"算力实现了没有"是两件事**，
+前者不该被显卡卡住。
 
-也就是说 **CUDA 路径目前是"照文档写的"，不是"验过的"**。装完 Toolkit 的第一件事应该是
-把这三项跑一遍，而不是直接开始写 kernel。
+### 已验过的（P0 全绿，2026-10-12）
+
+| 项 | 环境 | 结果 |
+| --- | --- | --- |
+| `check_sync.py` | WSL | 22 一致 / 0 分叉 / 0 缺失 |
+| `abi_smoke.py`（host-only，带真实权重） | Windows | 32 通过 / 0 失败 |
+| `abi_smoke.py`（CUDA 产物，带真实权重） | WSL | 32 通过 / 0 失败 |
+| `cuda_check` | WSL + CUDA 13.2 | RTX 5060 Laptop / 算力 **12.0** / 26 SM / 显存 6.9+8.0 GiB；device 计算 + 搬运全对 |
+
+### ⚠️ 首次编译暴露的两个真问题
+
+这两个都是 **host-only 构建永远看不到的**（`RPG_HAS_CUDA` 未定义时整段被 `#ifdef` 掉），
+也正是"没验过就不算"的实证：
+
+1. **`cuda_common.h` 把 `#include <cuda_runtime.h>` 放在了 `namespace rpg {` 里面** ——
+   libstdc++ 的 `namespace std` 被嵌套成 `rpg::std`，此后该 TU 里每个 `std::` 名字都解析不到，
+   而报错点全落在标准库内部（`'vector' in namespace 'rpg::std' does not name a template type`、
+   `'is_nothrow_move_constructible' was not declared in this scope`），极难从现象反推。
+   **修法**：include 移到 namespace 之前，并改用 `cuda_runtime_api.h`（host 侧只需要 `cudaError_t`
+   与内存 API，完整头会带进 `__host__`/`__device__` 那一套宏）。
+2. **`CMakeLists.txt` 的 `cuda_check` 目标漏了 `src/cuda_common.cc`** —— 链接期
+   `undefined reference to rpg::DescribeDevice`。`.cu` 里只有 CUDA 那一半，描述文本那一半在 `.cc`。
 
 ## 用起来
 

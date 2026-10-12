@@ -16,6 +16,11 @@
 #include "common.h"
 #include "cuda_common.h"
 
+// 显式 include 完整 runtime 头：这个 TU 有 kernel 定义与启动（<<<>>>），
+// 需要的是完整头，而不是 cuda_common.h 里那个给 host 用的 cuda_runtime_api.h。
+// （nvcc 其实会自动包含它，但依赖隐式行为不利于"换一台机器"时排查。）
+#include <cuda_runtime.h>
+
 namespace {
 
 __global__ void ScaleKernel(const float* in, float* out, int n, float k) {

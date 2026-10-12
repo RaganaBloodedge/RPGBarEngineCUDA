@@ -6,6 +6,10 @@
 
 #include "cuda_common.h"
 
+// 完整头（相对 cuda_common.h 里的 cuda_runtime_api.h）：这个 TU 由 nvcc 编译，
+// 且要调用设备查询/内存搬运的 runtime API，用完整头最省心。
+#include <cuda_runtime.h>
+
 #include <string>
 
 #include "common.h"   // rpg::Throw / RPG_LOG_WARN / RPG_SZ

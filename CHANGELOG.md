@@ -57,9 +57,16 @@
 
 ### 说明
 
-- **P0 的判据分两档**：不需要 CUDA 的那一档（`check_sync.py` + `abi_smoke.py`）已经全绿；
-  需要 Toolkit 的那一档（`cuda_check`）等装完 `nvcc` 才能跑。骨架能编、错误路径说人话，
-  与"算力实现了没有"是两件事，前者不该被显卡卡住。
-- ⚠️ **CUDA 路径目前尚未被编译过**：`CMakeLists.txt`、`tools/cuda_check.cu`、
-  `src/cuda_common.cu` 在本机一次都没被编译（没有 `cmake`，也没有 `nvcc`）——
-  它们是"照文档写的"，不是"验过的"。装完 Toolkit 的第一件事是把这三项跑一遍。
+- **P0 的两档判据全绿**（2026-10-12）。不需要显卡的那一档在 Windows 上跑
+  （`check_sync.py` 22 一致 / `abi_smoke.py` 32 通过）；需要显卡的那一档在 WSL +
+  CUDA 13.2 上跑（`abi_smoke.py` 32 通过；`cuda_check` 报出 RTX 5060 Laptop / 算力 12.0 /
+  26 SM，device 计算与搬运全对）。
+- **CUDA 路径的构建放在 WSL 里**，因为 Windows 侧没有 MSVC（而 nvcc 不接受 g++ 当宿主
+  编译器）。为此新增 `build_wsl.sh`：源码留在 `/mnt/e`（一份，不会分叉），构建目录落
+  WSL 原生 ext4（9p 上的顺序写只有 173 MB/s，原生是 2.5 GB/s）。产物 `librpg_engine.so`
+  供 P0–P2 的算法对拍使用；宿主能加载的 `.dll` 等 P3 时补 MSVC + Windows 版 Toolkit。
+- **首次编译抓出两个真问题**（host-only 构建看不到，因为相关代码被 `#ifdef` 掉）：
+  `cuda_common.h` 把 `<cuda_runtime.h>` include 进了 `namespace rpg`（libstdc++ 的
+  `namespace std` 被嵌套成 `rpg::std`，该 TU 全线崩、报错却全落在标准库内部）；
+  `cuda_check` 目标漏了 `src/cuda_common.cc`（链接期找不到 `rpg::DescribeDevice`）。
+  两处都已修，教训写进 DESIGN §8。
