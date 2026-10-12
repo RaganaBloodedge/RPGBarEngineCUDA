@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
     // E 要用到 seq + max_tokens 个位置，再加一次生成的余量。
     const int64_t want = seq + 2 * static_cast<int64_t>(max_tokens) + 8;
     const int64_t cap = max_seq > 0 ? max_seq : ((want + 255) / 256) * 256;
-    RPG_CHECK(cap <= max_pos, "KV 容量 %lld 超过 RoPE 表覆盖的 %d", 
+    RPG_CHECK(cap <= max_pos, "KV 容量 %lld 超过 RoPE 表覆盖的 %d",
               static_cast<long long>(cap), max_pos);
 
     std::printf("\n[输入] %lld 个 token；每次生成 %d 个；seed = %llu\n",
@@ -376,7 +376,7 @@ int main(int argc, char** argv) {
         std::printf("  out1[1..] == out2[0..]（%lld 个）逐位相同：OK\n",
                     static_cast<long long>(n_cmp));
       } else {
-        std::printf("  **失败**：%lld/%lld 处不同，位置：", 
+        std::printf("  **失败**：%lld/%lld 处不同，位置：",
                     static_cast<long long>(bad.size()),
                     static_cast<long long>(n_cmp));
         for (size_t i = 0; i < bad.size() && i < 8; ++i) {
