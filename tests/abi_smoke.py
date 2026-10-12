@@ -146,14 +146,16 @@ def main() -> int:
             if s >= 0:
                 check("session_reset 成功", lib.rpg_engine_session_reset(s) == 0)
                 # generate 必须**明确报错**，而不是返回一段假文本。
-                # P1 之后这条依然要守：整网前向已经能跑（tools/layer_check 里
-                # 逐层对拍过），但它**没接进 ABI** —— 报错文案必须把这个区别说清，
-                # 否则宿主会以为是"没 GPU / 没编 CUDA"，去查错方向。
+                # P1/P2 之后这条依然要守：整网前向与增量解码都已经跑通并对拍过
+                # （tools/layer_check、tools/gen_check），但它们**没接进 ABI** ——
+                # 报错文案必须把这个区别说清，否则宿主会以为是"没 GPU / 没编
+                # CUDA"，去查错方向。
                 out = lib.rpg_engine_generate(s, b'{"messages":[{"role":"user","content":"hi"}]}')
                 check("generate 尚未实现 → 返回 NULL", not out)
                 gerr = (lib.rpg_engine_last_error() or b"").decode("utf-8", "replace")
                 check("generate 的报错说明原因（不是空话）",
-                      ("未编译 CUDA" in gerr) or ("还没实现" in gerr), f"得到 {gerr!r}")
+                      ("未编译 CUDA" in gerr) or ("还没接进 ABI" in gerr),
+                      f"得到 {gerr!r}")
                 print(f"  generate 的报错：{gerr.splitlines()[0] if gerr else '(空)'}")
                 lib.rpg_engine_session_destroy(s)
 

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# 用 **CPU 引擎（RPGBarEngine）自己的源码** 编出 forward_check —— P1 对拍的参考侧。
+# 用 **CPU 引擎（RPGBarEngine）自己的源码** 编出对拍参考侧：
+#
+#   forward_check  —— P1 用。直接编 RPGBarEngine/tools/forward_check.cc（原样）
+#   cpu_ref_gen    —— P2 用。编本仓库的 tools/cpu_ref_gen.cc，但**链接的仍然是
+#                     CPU 引擎的源码**
 #
 # ## 为什么不把 CPU 前向抄进本仓库
 #
@@ -9,21 +13,37 @@
 # 所以这里只给它一条编译命令，源码原封不动留在 RPGBarEngine 仓库里；本仓库
 # 一个字节都不复制。
 #
+# ## cpu_ref_gen 为什么必须有（而不是直接用 CPU 仓库的 tools/gen_check）
+#
+# gen_check 不导出每步 logits，而 DESIGN §7.3 要求在分歧处"打印两边各自的
+# top-5 logits"。缺了参考侧的数字，那条判据只有一半。修法不是改上位仓库
+# （那要走它的发版流程），而是**只换 main、不换实现**：cpu_ref_gen.cc 通过
+# `#include "qwen3.h"` 使用 CPU 引擎的 Model / ForwardFull / ForwardStep /
+# GenerateGreedy / ArgMax —— 前向与解码逻辑一行都不是抄的。
+#
 # ## 为什么不能直接用 CPU 仓库的 build.sh
 #
 # 那个脚本是给 MSYS2/MinGW 写的：-static、rpg_engine.def、--exclude-all-symbols
 # 都是 Windows 专有，在 Linux 上第一条链接就失败。所以这里只取它的编译约定
 # （matmul_avx2.cc 单独开 -mavx2 -mfma，其余保持基线），重写一条 Linux 命令。
 #
+# ⚠️ **刻意不给这里加 -ffp-contract=off**：参考侧代表"CPU 引擎真的在跑的那一份"，
+# 它默认是 FMA 收缩的（与它在 Windows/MinGW 上被编出来的行为一致）。本仓库
+# host 侧加 -ffp-contract=off 是为了让**反量化逐位对拍**（DESIGN §7.1）成立 ——
+# 那是另一个判据、另一条编译线，两者不要混。
+#
 # 用法：
 #   bash tools/build_cpu_ref.sh [输出目录]
 #   RPG_CPU_ENGINE_DIR=/path/to/RPGBarEngine bash tools/build_cpu_ref.sh
 #
-# 产物：<输出目录>/forward_check
+# 产物：<输出目录>/forward_check、<输出目录>/cpu_ref_gen
 #
 set -euo pipefail
 
 SRC="${RPG_CPU_ENGINE_DIR:-/mnt/e/Workspace/RPGBarEngine}"
+# 本仓库根目录（这个脚本在 tools/ 下）
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
 OUT="${1:-$HOME/cuda-build}"
 CXX="${CXX:-g++}"
 JOBS="${RPG_JOBS:-$(nproc)}"
@@ -33,13 +53,17 @@ if [ ! -f "$SRC/tools/forward_check.cc" ]; then
   echo "用 RPG_CPU_ENGINE_DIR=<RPGBarEngine 路径> 指定 CPU 引擎仓库的位置。" >&2
   exit 1
 fi
+if [ ! -f "$HERE/cpu_ref_gen.cc" ]; then
+  echo "找不到 $HERE/cpu_ref_gen.cc" >&2
+  exit 1
+fi
 
 mkdir -p "$OUT"
 OBJDIR="$OUT/cpu-ref-obj"
 mkdir -p "$OBJDIR"
 
 echo "CPU 引擎源码：$SRC"
-echo "输出：$OUT/forward_check"
+echo "输出：$OUT/forward_check、$OUT/cpu_ref_gen"
 echo "编译器：$($CXX --version | head -1)"
 
 INCLUDES="-I$SRC/include -I$SRC/src -I$SRC/tools"
@@ -57,7 +81,7 @@ else
   echo "  (编译器不支持 -mavx2 -mfma，AVX2 内核退化为标量)"
 fi
 
-echo "[1/2] 编译 CPU 引擎源码..."
+echo "[1/3] 编译 CPU 引擎源码..."
 OBJS=""
 for f in "$SRC"/src/*.cc; do
   b="$(basename "${f%.cc}")"
@@ -68,11 +92,15 @@ for f in "$SRC"/src/*.cc; do
   OBJS="$OBJS $o"
 done
 
-echo "[2/2] 链接 forward_check..."
 # 先链 .new 再 mv -f：与两边仓库的构建脚本同一个环境对策（直接覆盖已存在
 # 的产物在某些沙箱下会静默失败）。
+echo "[2/3] 链接 forward_check（RPGBarEngine 自己的 main）..."
 "$CXX" $CXXFLAGS -o "$OUT/forward_check.new" "$SRC/tools/forward_check.cc" $OBJS -pthread
 mv -f "$OUT/forward_check.new" "$OUT/forward_check"
 
-ls -la "$OUT/forward_check"
+echo "[3/3] 链接 cpu_ref_gen（本仓库的 main + CPU 引擎的实现）..."
+"$CXX" $CXXFLAGS -o "$OUT/cpu_ref_gen.new" "$HERE/cpu_ref_gen.cc" $OBJS -pthread
+mv -f "$OUT/cpu_ref_gen.new" "$OUT/cpu_ref_gen"
+
+ls -la "$OUT/forward_check" "$OUT/cpu_ref_gen"
 echo "OK"
