@@ -60,3 +60,6 @@
 - **P0 的判据分两档**：不需要 CUDA 的那一档（`check_sync.py` + `abi_smoke.py`）已经全绿；
   需要 Toolkit 的那一档（`cuda_check`）等装完 `nvcc` 才能跑。骨架能编、错误路径说人话，
   与"算力实现了没有"是两件事，前者不该被显卡卡住。
+- ⚠️ **CUDA 路径目前尚未被编译过**：`CMakeLists.txt`、`tools/cuda_check.cu`、
+  `src/cuda_common.cu` 在本机一次都没被编译（没有 `cmake`，也没有 `nvcc`）——
+  它们是"照文档写的"，不是"验过的"。装完 Toolkit 的第一件事是把这三项跑一遍。

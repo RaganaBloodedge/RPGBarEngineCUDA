@@ -192,6 +192,12 @@ python tests/abi_smoke.py --lib build/rpg_engine.dll --model models/Qwen3-1.7B-Q
 | 编译器 | MSVC 2022 或 g++ 13+（host 部分） |
 | 显存 | ≥ 4 GB（1.03 GiB 权重 + 448 MiB/会话 KV + 中间张量） |
 
+> ⚠️ **尚未验证的部分（2026-10-12 建仓时）**：`CMakeLists.txt`、`tools/cuda_check.cu`、
+> `src/cuda_common.cu` 在本机**一次都没被编译过** —— 这台机器既没有 `cmake` 也没有 `nvcc`。
+> 它们是"照文档写的"，**不是"验过的"**。装完 Toolkit 的第一件事是跑一遍
+> `cmake -S . -B build && cmake --build build -j && ./build/cuda_check`，
+> **再**开始写 kernel。别把"没报错的推测"当成"已验证的结论"。
+
 ### 编译
 
 ```bash

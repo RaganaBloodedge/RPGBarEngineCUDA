@@ -54,6 +54,18 @@ python tests/abi_smoke.py --lib build/rpg_engine.dll --model models/Qwen3-1.7B-Q
 第一条不需要显卡、不需要权重，第二条与第三条不需要显卡 —— **"骨架能编、错误路径说人话"
 和"算力实现了没有"是两件事**，前者不该被显卡卡住。
 
+### ⚠️ 当前哪些代码还没被编译过
+
+| 文件 | 状态 |
+| --- | --- |
+| `src/` 里 host 层的全部文件 | ✅ `build_host.sh` 编过、链接过，`abi_smoke.py` 在真实权重上跑过 |
+| `CMakeLists.txt` | ❌ **一次都没跑过** —— 本机没装 `cmake` |
+| `tools/cuda_check.cu` | ❌ 没编译过 —— 本机没装 `nvcc` |
+| `src/cuda_common.cu` | ❌ 没编译过 —— 同上 |
+
+也就是说 **CUDA 路径目前是"照文档写的"，不是"验过的"**。装完 Toolkit 的第一件事应该是
+把这三项跑一遍，而不是直接开始写 kernel。
+
 ## 用起来
 
 产物是 `rpg_engine.dll` / `librpg_engine.so`，与 CPU 版**同名同 ABI**。
