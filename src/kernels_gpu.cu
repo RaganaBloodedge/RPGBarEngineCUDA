@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "common.h"
@@ -38,6 +39,11 @@ constexpr int kThreads = 128;
 // 权重在每个 tile 里只被反量化一遍，token 越多摊得越薄。4 是 128 线程下的
 // 折中（再多就要加共享内存或寄存器中转）。
 constexpr int kTileTokens = 4;
+
+// argmax 那一个 block 的线程数。词表 151936 个元素，1024 线程 → 每线程 149 个。
+// 单 block 而不是多 block + 二次归约：vocab 的量级下 1024 线程的树形归约只要
+// 10 步，多 block 反而要多一次 kernel 启动与一次中间结果回写。
+constexpr int kArgMaxThreads = 1024;
 
 // ggml 块的形状在 host 侧算好传进来（设备端没有 TypeInfo —— 那是一张
 // host 侧的表，搬到设备上只是为了省两次整数除法，不值）。
@@ -268,6 +274,159 @@ __global__ void CausalAttentionKernel(const float* q, const float* k,
   }
 }
 
+// ---------------------------------------------------------------- KV Cache（P2）
+
+// 本段 K/V → cache。源是 [t][head][dim]，目标是 [head][pos][dim] —— **布局不同**，
+// 所以是一次带下标重排的遍历，不是整段拷贝。
+__global__ void KvWriteKernel(const float* __restrict__ k_src,
+                              const float* __restrict__ v_src,
+                              int32_t n_kv_heads, int32_t head_dim, int64_t pos0,
+                              int64_t max_seq, int64_t total,
+                              __half* __restrict__ k_dst,
+                              __half* __restrict__ v_dst) {
+  const int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  if (i >= total) return;
+  const int64_t d = i % head_dim;
+  const int64_t r = i / head_dim;  // = t * n_kv_heads + h
+  const int32_t h = static_cast<int32_t>(r % n_kv_heads);
+  const int64_t t = r / n_kv_heads;
+  const int64_t dst =
+      ((static_cast<int64_t>(h) * max_seq + pos0 + t) * head_dim) + d;
+  // 源的下标正好就是 i（它就是 [t][h][d] 行主），不需要再算一遍。
+  k_dst[dst] = __float2half_rn(k_src[i]);
+  v_dst[dst] = __float2half_rn(v_src[i]);
+}
+
+// 从 cache 读历史的因果注意力。一个 block 一对 (t, head) —— 与不带 cache 的
+// CausalAttentionKernel 同一结构，只有两处不同：KV 的来源（cache fp16）、
+// 遍历上界（pos0 + t 而不是 t）。
+//
+// ⚠️ 这里与 CausalAttentionKernel 有**刻意的重复**（softmax 那一段一模一样）。
+// 不抽公共函数的理由：那个 kernel 的数值路径已经被 P1 的逐层对拍钉死过，
+// 动它就意味着 P1 的结论要重证一遍；而复制一份"跑在另一条数据来源上"的实现，
+// 出问题时能独立看，代价是几十行。
+__global__ void AttentionFromCacheKernel(const float* __restrict__ q,
+                                         const __half* __restrict__ k_layer,
+                                         const __half* __restrict__ v_layer,
+                                         int64_t max_seq, int32_t n_heads,
+                                         int32_t n_kv_heads, int32_t head_dim,
+                                         float scale, int64_t pos0,
+                                         int64_t n_scores,
+                                         float* __restrict__ out) {
+  const int64_t th = blockIdx.x;
+  const int64_t t = th / n_heads;
+  const int32_t h = static_cast<int32_t>(th - t * n_heads);
+  const int32_t group = n_heads / n_kv_heads;
+  const int32_t kh = h / group;
+  const int64_t q_stride = static_cast<int64_t>(n_heads) * head_dim;
+  const int64_t pos = pos0 + t;  // 本行在**绝对**位置上的下标
+
+  extern __shared__ float sh[];
+  // n_scores = pos0 + seq（本段里最大的那个绝对位置 + 1）。**不能按 seq 备**：
+  // 本 kernel 的 scores 下标是绝对位置，pos0 > 0 时按 seq 备就会写到缓冲区
+  // 后面去。CPU 版在同一处踩过一次堆越界（症状是"单轮正常、第二轮无声消失"），
+  // 这里从一开始就按绝对位置数备。
+  float* scores = sh;
+  const size_t fl = (static_cast<size_t>(n_scores) + 1u) & ~static_cast<size_t>(1u);
+  double* red = reinterpret_cast<double*>(sh + fl);  // 8 字节对齐
+
+  const __half* kb =
+      k_layer + static_cast<int64_t>(kh) * max_seq * head_dim;
+  const __half* vb =
+      v_layer + static_cast<int64_t>(kh) * max_seq * head_dim;
+  const float* qt =
+      q + t * q_stride + static_cast<int64_t>(h) * head_dim;
+
+  // 1) QKᵀ/√d —— 遍历 [0, pos]（cache 里的全部历史，含本段排在它前面的）。
+  for (int64_t s = threadIdx.x; s <= pos; s += kThreads) {
+    const __half* ks = kb + s * head_dim;
+    float acc = 0.0f;
+    for (int32_t d = 0; d < head_dim; ++d) acc += qt[d] * __half2float(ks[d]);
+    scores[s] = acc * scale;
+  }
+  __syncthreads();
+
+  // 2) softmax（减最大值 → exp → double 求和 → 归一化）
+  float lmax = -FLT_MAX;
+  for (int64_t s = threadIdx.x; s <= pos; s += kThreads) {
+    lmax = fmaxf(lmax, scores[s]);
+  }
+  red[threadIdx.x] = static_cast<double>(lmax);
+  __syncthreads();
+  for (int st = kThreads / 2; st > 0; st >>= 1) {
+    if (threadIdx.x < st) {
+      red[threadIdx.x] = red[threadIdx.x] > red[threadIdx.x + st]
+                             ? red[threadIdx.x]
+                             : red[threadIdx.x + st];
+    }
+    __syncthreads();
+  }
+  const float mx = static_cast<float>(red[0]);
+  __syncthreads();  // red 马上要复用成求和累加器
+
+  double lsum = 0.0;
+  for (int64_t s = threadIdx.x; s <= pos; s += kThreads) {
+    const float e = expf(scores[s] - mx);
+    scores[s] = e;
+    lsum += static_cast<double>(e);
+  }
+  red[threadIdx.x] = lsum;
+  __syncthreads();
+  for (int st = kThreads / 2; st > 0; st >>= 1) {
+    if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+    __syncthreads();
+  }
+  const float inv = static_cast<float>(1.0 / red[0]);
+  for (int64_t s = threadIdx.x; s <= pos; s += kThreads) scores[s] *= inv;
+  __syncthreads();
+
+  // 3) 加权求和 V（按 s 递增读 cache —— cache 里同一头的连续位置是连续的）
+  float* ot = out + t * q_stride + static_cast<int64_t>(h) * head_dim;
+  for (int32_t d = threadIdx.x; d < head_dim; d += kThreads) {
+    float acc = 0.0f;
+    for (int64_t s = 0; s <= pos; ++s) {
+      acc += scores[s] * __half2float(vb[s * head_dim + d]);
+    }
+    ot[d] = acc;
+  }
+}
+
+// ---------------------------------------------------------------- ArgMax
+
+__global__ void ArgMaxKernel(const float* __restrict__ x, int64_t n,
+                             int32_t* __restrict__ out_idx) {
+  float bv = -FLT_MAX;
+  int32_t bi = 0;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+    const float v = x[i];
+    // 严格大于 → 线程内并列时保留**先遇到**的那个（下标更小）
+    if (v > bv) {
+      bv = v;
+      bi = static_cast<int32_t>(i);
+    }
+  }
+  __shared__ float sv[kArgMaxThreads];
+  __shared__ int32_t si[kArgMaxThreads];
+  sv[threadIdx.x] = bv;
+  si[threadIdx.x] = bi;
+  __syncthreads();
+  for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+    if (threadIdx.x < st) {
+      const float vr = sv[threadIdx.x + st];
+      const int32_t ir = si[threadIdx.x + st];
+      // 归约时也要保证"并列取最小下标"，否则跨线程的并列会取到任意一个 ——
+      // 而 CPU 版是确定性的最小下标。这一条不写，判据会随机红。
+      if (vr > sv[threadIdx.x] ||
+          (vr == sv[threadIdx.x] && ir < si[threadIdx.x])) {
+        sv[threadIdx.x] = vr;
+        si[threadIdx.x] = ir;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) *out_idx = si[0];
+}
+
 // ---------------------------------------------------------------- 逐元素
 
 __global__ void SiluMulKernel(float* gate, const float* up, int64_t n) {
@@ -377,6 +536,59 @@ void GpuCausalAttention(const ModelMeta& c, const float* q_dev,
       q_dev, k_dev, v_dev, seq, c.n_heads, c.n_kv_heads, c.head_dim, scale,
       out_dev);
   CheckLaunch("CausalAttentionKernel");
+}
+
+void GpuKvWrite(const float* k_dev, const float* v_dev, int32_t n_kv_heads,
+                int32_t head_dim, int64_t pos0, int64_t seq,
+                uint16_t* k_cache_layer, uint16_t* v_cache_layer,
+                int64_t max_seq) {
+  RPG_CHECK(seq > 0 && n_kv_heads > 0 && head_dim > 0, "KvWrite 参数不合法");
+  RPG_CHECK(pos0 >= 0, "写入位置 %lld 不能为负", static_cast<long long>(pos0));
+  RPG_CHECK(pos0 + seq <= max_seq, "写入区间 [%lld, %lld) 超出 cache 容量 %lld",
+            static_cast<long long>(pos0), static_cast<long long>(pos0 + seq),
+            static_cast<long long>(max_seq));
+  const int64_t total = seq * n_kv_heads * head_dim;
+  KvWriteKernel<<<GridFor(total, 256), 256>>>(
+      k_dev, v_dev, n_kv_heads, head_dim, pos0, max_seq, total,
+      reinterpret_cast<__half*>(k_cache_layer),
+      reinterpret_cast<__half*>(v_cache_layer));
+  CheckLaunch("KvWriteKernel");
+}
+
+void GpuAttentionFromCache(const ModelMeta& c, int64_t pos0, const float* q_dev,
+                           int64_t seq, const uint16_t* k_layer,
+                           const uint16_t* v_layer, int64_t max_seq,
+                           float* out_dev) {
+  RPG_CHECK(seq > 0, "attention 的 seq 必须为正");
+  RPG_CHECK(pos0 >= 0, "pos0 不能为负");
+  const float scale = 1.0f / sqrtf(static_cast<float>(c.head_dim));
+  // scores 按**绝对位置数** n_scores = pos0 + seq 备（见 kernel 里的说明）。
+  const int64_t n_scores = pos0 + seq;
+  const size_t fl =
+      (static_cast<size_t>(n_scores) + 1u) & ~static_cast<size_t>(1u);
+  const size_t sh_bytes = (fl + kThreads * 2u) * sizeof(float);
+  // 默认上限 48 KiB：n_scores 到 6144（RPGBar 的上下文上限）时是 6144 + 256 =
+  // 6400 个 float = 25.6 KiB，够用。留这段是为了将来把 max_seq 调更大时，
+  // 收到的是一条明确的启动失败，而不是一个"kernel 莫名返回错误"的谜题。
+  if (sh_bytes > 48 * 1024) {
+    RPG_CUDA_CHECK(cudaFuncSetAttribute(
+        AttentionFromCacheKernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(sh_bytes)));
+  }
+  const int64_t blocks = seq * c.n_heads;
+  AttentionFromCacheKernel<<<static_cast<unsigned>(blocks), kThreads, sh_bytes>>>(
+      q_dev, reinterpret_cast<const __half*>(k_layer),
+      reinterpret_cast<const __half*>(v_layer), max_seq, c.n_heads,
+      c.n_kv_heads, c.head_dim, scale, pos0, n_scores, out_dev);
+  CheckLaunch("AttentionFromCacheKernel");
+}
+
+void GpuArgMax(const float* x_dev, int64_t n, int32_t* out_idx_dev) {
+  RPG_CHECK(n > 0, "argmax 的长度必须为正");
+  RPG_CHECK(n <= 0x7FFFFFFF, "argmax 的下标超出 int32（%lld）",
+            static_cast<long long>(n));
+  ArgMaxKernel<<<1, kArgMaxThreads>>>(x_dev, n, out_idx_dev);
+  CheckLaunch("ArgMaxKernel");
 }
 
 void GpuSiluMulInPlace(float* gate_dev, const float* up_dev, int64_t n) {

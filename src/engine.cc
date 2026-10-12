@@ -54,8 +54,9 @@ constexpr float kMaxTemperature = 2.0f;
 struct Session {
   int32_t model = -1;
 
-  // P1：前向本身已经实现并逐层对拍过，但**验证走 tools/layer_check**，
-  // ABI 侧还没有挂上任何显存状态。P2 把 KV Cache 与上卡接进来之后，这里才会有
+  // P1/P2：前向与增量解码都已经实现并对拍过（逐层走 tools/layer_check、
+  // 逐 token 走 tools/gen_check），但**验证都走命令行工具** —— ABI 侧还没有
+  // 挂上任何显存状态。P3 把 GpuModel / GpuKvCache 接进会话之后，这里才会有
   // 显存句柄；在那之前 reset 保持空操作（不假装清了个东西）。
   int32_t max_tokens = kDefaultMaxTokens;
   std::vector<std::string> stop;
@@ -180,7 +181,7 @@ int32_t rpg_engine_load_model(const char* model_path, const char* config_json) {
     entry->default_max_seq = ctx;
 
     RPG_LOG_INFO("已加载 %s（%d 层 / hidden %d / %d 头 / %d KV 头 / 词表 %d / "
-                 "位置 %d）—— 只读元数据，权重未上传显存（上卡在 P2 接进 ABI）",
+                 "位置 %d）—— 只读元数据，权重未上传显存（上卡在 P3 接进 ABI）",
                  mm.name.c_str(), mm.n_layers, mm.hidden, mm.n_heads,
                  mm.n_kv_heads, mm.vocab, entry->max_pos);
 
@@ -289,7 +290,7 @@ int32_t rpg_engine_session_reset(int32_t session) {
     rpg::SetLastError("");
     Session* s = RequireSession(session);  // 不存在即抛 → 返回负值
     (void)s;
-    // P0：会话还没有 KV 状态，reset 是空操作。P1 起这里清显存里的 KV 与 token 历史。
+    // 会话还没有 KV 状态，reset 是空操作。P3 起这里清显存里的 KV 与 token 历史。
     return RPG_ENGINE_OK;
   }
   RPG_ABI_CATCH(-1)
@@ -303,9 +304,15 @@ char* rpg_engine_generate(int32_t session, const char* request_json) {
     (void)request_json;
     // ABI 到这里为止。**明确报错，不返回假文本。**
 #ifdef RPG_HAS_CUDA
+    // P2 已经把整网前向 + KV Cache + 增量解码做出来、并逐 token 对拍过
+    // （tools/gen_check 与 tests/run_p2.sh）。但那些验证**都走命令行工具**：
+    // session 级的显存状态（GpuModel / GpuKvCache 的句柄）要到 P3 才挂上来。
+    // 报错文案必须把这个区别说清 —— 否则宿主会以为是"没 GPU / 没编 CUDA"，
+    // 去查错方向。
     rpg::Throw(
-        "CUDA 后端的整网生成还没实现（P1 只做到「无 KV Cache 的整网前向」，"
-        "逐层对拍已过 —— 见 docs/DESIGN.md §5 的阶段表）。"
+        "CUDA 后端的生成还没接进 ABI（P2 已完成整网前向 + KV Cache + 增量解码，"
+        "逐层与逐 token 对拍都过 —— 见 tools/gen_check 与 tests/run_p2.sh；"
+        "把显存状态挂进 session 是 P3 的事）。"
         "当前产物编入了 CUDA 支持，但 rpg_engine_generate 还是空的，"
         "请暂时用 RPGBarEngine 的 CPU 版。");
 #else

@@ -80,6 +80,7 @@ set(RPG_HOST_SOURCES
 set(RPG_CUDA_SOURCES
   src/cuda_common.cu
   src/gpu_model.cu
+  src/kv_cache_gpu.cu
   src/kernels_gpu.cu
   src/qwen3_gpu.cu
 )
@@ -168,4 +169,13 @@ if(RPG_HAS_CUDA)
   rpg_add_tool(dequant_check tools/dequant_check.cu)
   # P1 判据之二：整段前向，写 npy 供与 CPU 引擎对拍。
   rpg_add_tool(layer_check tools/layer_check.cu)
+  # P2 判据之一：KV Cache 写入的**下标映射**（不需要模型，纯确定性）。
+  # 单独立一条的理由：映射错了不会崩，只会读到别的头/别的位置的历史 —— 症状与
+  # "kv 的 fp16 精度不够"长得一模一样，而后者是可接受的取舍。这条把两者分开。
+  rpg_add_tool(kv_map_check tools/kv_map_check.cu)
+  # P2 判据：增量解码 + 贪心生成 + KV 自检，写 gen.txt / step_logits.npy
+  # 供与 CPU 引擎逐 token 对拍。注意**参考侧不在这里** —— 它是
+  # tools/cpu_ref_gen.cc，由 tools/build_cpu_ref.sh 从 RPGBarEngine 的源码
+  # 现编（理由见 DESIGN §7 末：参考实现必须是"真的在跑的那一份"）。
+  rpg_add_tool(gen_check tools/gen_check.cu)
 endif()

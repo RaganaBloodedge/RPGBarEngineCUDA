@@ -57,7 +57,8 @@ cmake --build "$BUILD" -j"$JOBS"
 
 echo "--- 产物 ---"
 ls -la "$BUILD"/librpg_engine.so "$BUILD"/cuda_check "$BUILD"/dequant_check \
-       "$BUILD"/layer_check 2>/dev/null || ls -la "$BUILD" | grep -E "\.so$|_check$" || true
+       "$BUILD"/layer_check "$BUILD"/gen_check 2>/dev/null \
+  || ls -la "$BUILD" | grep -E "\.so$|_check$" || true
 echo
 echo "下一步（P0 第二档判据）："
 echo "  $BUILD/cuda_check"
@@ -65,3 +66,6 @@ echo "  python3 tests/abi_smoke.py --lib $BUILD/librpg_engine.so --model models/
 echo
 echo "P1 的一键判据（会顺带编 CPU 侧参考实现）："
 echo "  bash tests/run_p1.sh"
+echo
+echo "P2 的一键判据（增量解码 + 贪心生成，逐 token 对拍）："
+echo "  bash tests/run_p2.sh"

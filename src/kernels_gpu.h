@@ -65,9 +65,56 @@ void GpuRope(float* x, int32_t n_heads, int32_t head_dim, const float* rope_tab,
 // 全因果注意力（GQA，无滑动窗口）：out = softmax(QKᵀ/√d)V。
 // q: [seq, n_heads*head_dim]   k/v: [seq, n_kv_heads*head_dim]   out: 同 q。
 // 位置 t 只看 [0, t] —— 掩码靠"只遍历到 t"实现，不写 -inf 的格子。
+//
+// **这是 P1 的无 cache 路径**（q/k/v 全是本段算出来的）。带前缀的版本是
+// GpuAttentionFromCache —— 两条路径刻意分开、也刻意都要留着：它能一次性证明
+// "cache 的写入/读取没把布局搞错"（两条路径在同一段 token 上的差异只该来自
+// KV 的 fp16 舍入，不该是别的）。
 void GpuCausalAttention(const ModelMeta& c, const float* q_dev,
                         const float* k_dev, const float* v_dev, int64_t seq,
                         float* out_dev);
+
+// ---------------------------------------------------------------- P2：KV Cache
+
+// 把本段算出的 K/V 写进 cache（fp32 → fp16，round-to-nearest）。
+//   k_dev / v_dev : [seq, n_kv_heads * head_dim] 行主，本段的 K/V
+//   k_layer/v_cache_layer : **第 layer 层的**基址，[n_kv_heads, max_seq, head_dim]
+//   pos0          : 本段第一个位置在 cache 里的下标
+//
+// ⚠️ 源布局是 [t][head][dim]（一个 token 的多头排在一起），目标是 [head][pos][dim]
+// （一个头的连续位置排在一起）。**这两者不同**，所以不是整段 memcpy，而是一次
+// 带下标重排的遍历。写反了的症状：不崩，注意力读到别的头/别的位置的历史，
+// 生成结果从某个位置起慢慢跑偏。
+void GpuKvWrite(const float* k_dev, const float* v_dev, int32_t n_kv_heads,
+                int32_t head_dim, int64_t pos0, int64_t seq,
+                uint16_t* k_cache_layer, uint16_t* v_cache_layer, int64_t max_seq);
+
+// 从 KV Cache 读历史的因果注意力（GQA）。
+//   q_dev      : [seq, n_heads * head_dim]
+//   k/v_layer  : **第 layer 层的**基址，fp16，[n_kv_heads, max_seq, head_dim]
+//   max_seq    : 一个头占的位置数（= 头与头之间的步长）
+// 位置 pos = pos0 + t 能看到 cache 里 [0, pos] 的全部历史 —— 包括本段里排在它
+// 前面的（它们上一步已经写进去了），因果性自然成立，不需要额外的掩码。
+void GpuAttentionFromCache(const ModelMeta& c, int64_t pos0, const float* q_dev,
+                           int64_t seq, const uint16_t* k_layer,
+                           const uint16_t* v_layer, int64_t max_seq,
+                           float* out_dev);
+
+// 设备端 argmax：把**最大值的下标**写到 out_idx_dev（1 个 int32）。
+// **并列时取最小下标**，与 CPU 版 kernels.h 的 ArgMax 同语义（`x[i] > bv`
+// 严格大于）—— 差一个并列规则就会让"逐 token 一致"的判据红，而那种红会被
+// 误读成"数值精度不够"。
+//
+// 存在的理由：贪心解码每步都要 argmax，而 logits 是 [vocab] = 151936 个 float
+// （607 KB）。为了取一个下标回拷 607 KB 是纯浪费 —— 归约在设备端做完，调用方
+// 只回拷 4 个字节。
+//
+// ⚠️ 结果写在调用方给的显存里、**不自动回拷**，也不用函数内的静态缓冲：
+// 每步 cudaMalloc 一次 4 字节是同步操作（几十微秒），而命名空间级的静态
+// DeviceBuffer 要到进程退出才析构 —— 那时 CUDA 上下文可能已经销毁
+// （RPGBarEngine 的"退出挂起"就是这么来的）。落点用 GpuScratch::argmax_idx。
+void GpuArgMax(const float* x_dev, int64_t n, int32_t* out_idx_dev);
+
 
 // gate[i] = silu(gate[i]) * up[i]，就地。
 void GpuSiluMulInPlace(float* gate_dev, const float* up_dev, int64_t n);
