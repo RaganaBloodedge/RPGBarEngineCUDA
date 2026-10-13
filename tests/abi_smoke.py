@@ -1,15 +1,20 @@
 """abi_smoke.py —— C ABI 的冒烟测试。
 
-两种跑法，都不需要 CUDA：
+两种跑法：
 
     # 1) 只验 ABI 形状与错误路径（不需要权重，CI 里可跑）
     python tests/abi_smoke.py --lib build/rpg_engine.dll
 
-    # 2) 带上权重：额外验 load_model / model_info / generate 的报错文案
+    # 2) 带上权重：load_model / model_info / session_create / **一次真实生成**
     python tests/abi_smoke.py --lib build/rpg_engine.dll --model models/Qwen3-1.7B-Q4_K_M.gguf
 
 它验的是**宿主能看到的东西**：函数能不能调、返回值形状对不对、错误路径说的话
-是不是人话。不验数值 —— 那是 P1/P2 的对拍工作（见 docs/DESIGN.md §7）。
+是不是人话。**不验数值** —— 那是 P1/P2/P3 判据的活（见 docs/DESIGN.md §7）。
+
+⚠️ 第 2 档在 CUDA 构建下是"真跑"：load_model 会把 1.03 GiB 权重的量化字节搬上
+显存（几秒），generate 会真的解码几个 token。它只检查**响应的形状**（四个键在
+不在、finish_reason 取值合不合法），**不检查文本内容** —— 文本对不对是判据脚本
+的事。P3 之前这里断言的是"generate 必须明确报错"，那条现在不成立了。
 """
 from __future__ import annotations
 
@@ -145,18 +150,35 @@ def main() -> int:
             check("session_create 成功", s >= 0, f"句柄={s}")
             if s >= 0:
                 check("session_reset 成功", lib.rpg_engine_session_reset(s) == 0)
-                # generate 必须**明确报错**，而不是返回一段假文本。
-                # P1/P2 之后这条依然要守：整网前向与增量解码都已经跑通并对拍过
-                # （tools/layer_check、tools/gen_check），但它们**没接进 ABI** ——
-                # 报错文案必须把这个区别说清，否则宿主会以为是"没 GPU / 没编
-                # CUDA"，去查错方向。
-                out = lib.rpg_engine_generate(s, b'{"messages":[{"role":"user","content":"hi"}]}')
-                check("generate 尚未实现 → 返回 NULL", not out)
-                gerr = (lib.rpg_engine_last_error() or b"").decode("utf-8", "replace")
-                check("generate 的报错说明原因（不是空话）",
-                      ("未编译 CUDA" in gerr) or ("还没接进 ABI" in gerr),
-                      f"得到 {gerr!r}")
-                print(f"  generate 的报错：{gerr.splitlines()[0] if gerr else '(空)'}")
+                # P3：generate 真的实现了。这里只验**响应的形状** —— 是不是合法
+                # JSON、四个键在不在、finish_reason 取值合不合法。数值对不对是
+                # P1/P2/P3 判据的事（run_p1/p2/p3.sh），冒烟测试不该管。
+                #
+                # temperature=0 ⇒ 贪心：冒烟测试要的是**稳定**，不是"有随机性"。
+                out = lib.rpg_engine_generate(
+                    s, b'{"messages":[{"role":"user","content":"hi"}],'
+                       b'"max_tokens": 4, "temperature": 0}')
+                check("generate 返回非空", bool(out),
+                      "err=" + (lib.rpg_engine_last_error() or b"").decode("utf-8", "replace"))
+                go = None
+                if out:
+                    gtxt = take_str(lib, out)
+                    try:
+                        go = json.loads(gtxt)
+                    except ValueError as e:
+                        print(f"  generate 返回的不是 JSON：{e}；得到 {gtxt[:200]!r}")
+                check("generate 的返回是合法 JSON", go is not None)
+                if go is not None:
+                    for key in ("text", "tool_calls", "finish_reason", "usage"):
+                        check(f"响应有 {key}", key in go)
+                    check("finish_reason 是三种之一",
+                          go.get("finish_reason") in ("stop", "length", "tool_calls"),
+                          str(go.get("finish_reason")))
+                    u = go.get("usage") or {}
+                    check("usage 有 prompt_tokens / completion_tokens",
+                          "prompt_tokens" in u and "completion_tokens" in u)
+                    print(f"  generate：finish={go.get('finish_reason')} "
+                          f"text={go.get('text', '')[:40]!r} usage={u}")
                 lib.rpg_engine_session_destroy(s)
 
             info2 = take_str(lib, lib.rpg_engine_model_info(m))
