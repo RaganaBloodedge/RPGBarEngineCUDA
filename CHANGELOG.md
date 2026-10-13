@@ -271,6 +271,58 @@
 - **ABI 行为仍然没有任何变化**：`include/rpg_engine.h` 一个字节未动，`generate` 的
   报错文案也不变（`Session` 里还没有显存句柄 —— 那是 P3 的下一步）。
 
+### 新增（P3 第三步：接入 ABI）
+
+- **`rpg_engine_generate` 真的实现了**（`src/engine.cc`，370 → 约 590 行）：逐条对齐
+  CPU 版 `src/engine.cc` 的九步 —— 解析请求 → 渲染 ChatML + 分词 → 与 `cached_ids`
+  对最长公共前缀（`lcp == total` 时回退一位）→ 生成长度与容量检查（**会失败的条件
+  全部前置**，之后才动 cache）→ prefill → 停止 token（`eos` + `<|im_end|>` +
+  请求/会话的 stop 串）→ 生成 → 解码（`skip_special=false`）→ 拼响应 JSON
+  （`text` / `tool_calls` / `finish_reason` / `usage`）。
+  **`include/rpg_engine.h` 一个字节没改**：宿主（Python / Unity）不需要改任何代码。
+- **会话持显存状态**：`ModelEntry` 加 `std::unique_ptr<GpuModel>`（权重上卡，量化字节
+  原样上传 1.03 GiB）；`Session` 加 `std::unique_ptr<GpuKvCache>` + `GpuScratch` +
+  `cached_ids`。KV 在 **`session_create` 时分配**（显存不够要在建会话时报出来，而不是
+  生成到一半炸在 kernel 里）；`session_reset` 只归零长度、保留显存。
+- **`load_model` 的降级路径明确化**：设备完全不可用时只读元数据（P0 起就有的行为 ——
+  CI 与无卡机器要能 load、能读 `model_info`），此时 `ModelEntry::gpu == nullptr`，
+  建会话与生成各自报**不同**的错；但**设备可用而上传失败必须抛**（OOM、未知量化类型）。
+- **`rpg_engine_model_info` 多一项 `device_bytes`**（权重在显存里的实际占用）。
+  设备不可用时该键**不出现**，而不是报 0 —— 0 会被读成"权重不占显存"，那是另一回事。
+- **`engine.cc` 新增三个辅助函数**（`AppendStopString` / `AppendStopStrings` / `ContainsId`），
+  语义与 CPU 版逐字相同：停止串必须能变成单个 token，否则记警告并忽略（引擎按 token
+  粒度停，多 token 的文本级回看是宿主的职责）。
+- **`tests/abi_smoke.py`**：P0 时那条"generate 必须明确报错"的断言**换掉了** ——
+  改成验响应的形状（返回非空 / 合法 JSON / 四个键 / `finish_reason` 取值 / `usage` 字段）。
+  从 32 通过变成 **38 通过 / 0 失败**。
+
+### 说明（P3 第三步）
+
+- **端到端真的出文本了**（2026-10-13，WSL + CUDA 13.2 + RTX 5060 Laptop）：
+
+  ```text
+  问：用一句话介绍你自己。
+  答：我是一个AI助手，可以回答问题、提供信息和协助完成各种任务。  finish=stop
+      usage={'prompt_tokens': 17, 'completion_tokens': 18}
+
+  同会话第 2 轮（验前缀复用）：
+  答：我刚才说的是一句话，介绍我自己，说我是人工智能助手。
+      usage={'prompt_tokens': 37, 'completion_tokens': 16}
+  ```
+
+- **资源实测**：权重上卡 **1.05 GiB**（量化字节 1.03 GiB）/ 上传 **6.6–8.9 s**
+  （从 `/mnt/e` 经 9p 读盘）/ 设备剩余 **5.60 GiB**；会话 KV：512 容量 **56 MiB**、
+  1024 容量 **112 MiB**。
+- **与 CPU 版唯一的实质差异是"少做事"**：CPU 版 prefill 后要把 `rows × vocab` 的 logits
+  下载回 host 再取最后一行；这里传 `logits = nullptr`，`GpuGenerate` 直接吃显存地址 ——
+  **整个 decode 循环只回传 4 个字节**。
+- **回归全绿、数字一字不差**：`run_p3` 192/192 逐位、`run_p2` 32/32 逐 token + 满量程
+  **6.48e-4**、`run_p3_gen` A–E 全通过（E 31/31）、`run_p1` 最差 p99 **1.05e-4**、
+  `check_sync.py` 25 一致 / 0 分叉。**ABI 层的改动没有碰算力层。**
+- ⚠️ **P3 只剩一项没做完**：Windows 侧能加载的 `.dll`。nvcc 在 Windows 上只认 `cl.exe`，
+  这台机器没有 VS/MSVC ⇒ `models/rpg_engine.dll` 仍是 CPU 版，RPGBar 的 `smoke_test.py` /
+  `ui_check.js` 还没在 CUDA 引擎上跑过。**卡住的是编译器，不是接口。**
+
 ### 说明
 
 - **P0 的两档判据全绿**（2026-10-12）。不需要显卡的那一档在 Windows 上跑

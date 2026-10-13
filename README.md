@@ -18,7 +18,7 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 | P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿 |
 | P1 | 权重上卡 + 整网前向对拍 | ✅ **完成** —— 两条判据全绿（见下） |
 | P2 | KV Cache（fp16）+ 增量解码 + 贪心逐 token 对拍 | ✅ **完成** —— 三条判据全绿，**32/32 个 token 与 CPU 引擎完全一致** |
-| P3 | 采样（**已接进生成循环**）/ 工具调用 / 接入 RPGBar | 🔶 **进行中** —— 设备端采样两条判据全绿（一条**不需要模型**、一条走真实 decode 循环）；还差挂进 ABI session 与换 `rpg_engine.dll` |
+| P3 | 采样 + **接入 ABI**（`generate` 已实现）/ 工具调用 / 接入 RPGBar | 🔶 **进行中** —— 采样三条判据全绿；**ABI 的 `generate` 已经真的在生成**（`abi_smoke` **38/0**，端到端多轮对话跑通）；还差 Windows 侧 `.dll`（要 MSVC）与 RPGBar 端联调 |
 | P4 | 融合 kernel、CUDA Graph、量化直算 | 未开始 |
 
 **P1 的一句话结论**：同一份 GGUF、同一串 token，GPU 的 28 层前向与 CPU 引擎**逐层对得上**
@@ -49,10 +49,26 @@ logits，两边就该给出同一个 token）—— u 表 **192/192 位模式相
 **counter 用的是绝对位置**——把输出接在 prompt 后冷跑一遍，序列整体错一位
 **逐位相同**（31/31）。
 
+**P3 第三步（接入 ABI）的一句话结论**：`GpuModel` / `GpuKvCache` / `GpuScratch` 挂进了
+`Session`，`rpg_engine_generate` 从"明确报错"变成**真的在生成** —— 宿主（Python `ctypes`）
+走那 10 个 C 函数就能拿到可读文本：
+
+> 问：`用一句话介绍你自己。` ⇒ 答：`我是一个AI助手，可以回答问题、提供信息和协助完成各种任务。`
+> （`finish=stop`，`usage={'prompt_tokens': 17, 'completion_tokens': 18}`）
+
+多轮同会话的**前缀复用**也通了（第二轮 `prompt_tokens=37` 是整个 prompt，与 CPU 版语义一致）。
+`abi_smoke.py` 从 32 通过变成 **38 通过 / 0 失败**（新增 6 条：非空、合法 JSON、四个键、
+`finish_reason` 取值、`usage` 字段）。**与 CPU 版唯一的实质差异**是：那边必须把
+`rows × vocab` 的 logits 下载回 host 再取最后一行，这里把**整块搬运省掉了** ——
+`GpuGenerate` 直接吃显存地址，整个 decode 循环只回传 4 个字节。
+
 **工具链现状**：CUDA Toolkit **13.2 已装在 WSL（Ubuntu 24.04）**（`/usr/local/cuda`，
 版本与宿主 `nvidia-smi` 报的 13.2 精确对齐）。Windows 侧仍没有 nvcc / cmake / MSVC ——
 所以 CUDA 路径的构建走 WSL（`bash build_wsl.sh`），产物是 `librpg_engine.so`。
-要出宿主机（Windows）能加载的 `.dll`，得等 P3 时补 MSVC + Windows 版 Toolkit。
+要出宿主机（Windows）能加载的 `.dll`，得补 **MSVC + Windows 版 Toolkit** ——
+`-static` 与 CUDA 运行时不兼容，所以 Windows 的 CUDA 产物**不能**用 MinGW 编。
+**这是 P3 最后一项没做完的事**，而且它卡住的**只是编译器**：ABI 本身已经在 Linux
+（`librpg_engine.so`）上端到端跑通了，宿主侧的 `models/rpg_engine.dll` 现在仍是 CPU 版。
 
 没有 Toolkit 时这个仓库仍能编译（host 部分），只是 `generate` 会明确报"未编译 CUDA 后端"。
 
@@ -113,7 +129,7 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 分两档的理由 —— **"骨架能编、错误路径说人话"和"算力实现了没有"是两件事**，
 前者不该被显卡卡住。
 
-### 已验过的（2026-10-12）
+### 已验过的（2026-10-12 ~ 10-13）
 
 | 项 | 环境 | 结果 |
 | --- | --- | --- |
@@ -131,6 +147,8 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 | **`gen_sample_check` + `run_p3_gen.sh`**（P3 ②，要权重） | WSL + CUDA 13.2 | 同 seed 两遍 **32/32 逐位相同**；换 seed **31/32 处不同**；`T=0`+筛选参数与贪心**逐位相同**；`top_k=2` 每步都落前 2 名（32/32）；counter 绝对位置：暖/冷缓存 **31/31 逐位相同** |
 | **回归 `run_p2.sh`（新循环）** | WSL + CUDA 13.2 | 逐 token 仍 **32/32 完全一致**，满量程仍 **6.48e-4**（与 P2 记录的数字一模一样） |
 | **回归 `run_p1.sh`** | WSL + CUDA 13.2 | 29 项最差 p99 **1.05e-4**；logits max\|Δ\| **1.431e-4**（与 P1 记录一致） |
+| **`abi_smoke.py`（CUDA 产物 + 真实生成）**（P3 ③） | WSL + CUDA 13.2 | **38 通过 / 0 失败** —— 含 6 条 `generate` 断言（返回非空 / 合法 JSON / 四个键 / `finish_reason` 取值 / `usage` 字段） |
+| **端到端多轮生成**（`ctypes` 直调 ABI） | WSL + CUDA 13.2 | 单轮 `finish=stop`、文本通顺；同会话第二轮**前缀复用**生效（`prompt_tokens` 17 → 37）；权重上卡 **1.05 GiB / 6.6–8.9 s**；会话 KV（1024）**112 MiB** |
 
 ### P1 实测（21 token prefill，同一 prompt / 同一份 GGUF）
 
@@ -202,6 +220,13 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 尤其当"常识"（只留 1 个就该等于 argmax）听起来毫无破绽的时候。而 `sampler.h` 是
 **同源副本**，不许改，所以这里只记录、不修上游。
 
+**P3 第三步（ABI 接入）同样一次编过**：`engine.cc` 从 370 行涨到约 590 行（会话挂显存
+状态、九步 `generate`、三个停止串辅助函数），一次编译 + 一次 ABI 冒烟就全绿。唯一的
+"意外"不来自编译器，而来自**测试自己**：`abi_smoke.py` 里那句 P0 时代写下的
+"generate 必须明确报错"**过期了** —— P3 之后当然要改成"返回合法 JSON"。
+**写下"断言未来行为"的测试时，就得顺手记下"什么时候该来改它"**，否则它会安静地
+变成一道"只有实现退化时才通过"的假绿灯。
+
 ## 用起来
 
 产物是 `rpg_engine.dll` / `librpg_engine.so`，与 CPU 版**同名同 ABI**。
@@ -215,7 +240,8 @@ python scripts/engine_probe.py     # 在 RPGBar 仓库里跑，会打印引擎�
 
 ```
 include/rpg_engine.h    ← 逐字复制自 RPGBarEngine，是唯一契约（两边都不许单独改）
-src/                    ← host 层：ABI、GGUF、分词器、ChatML、工具解析、元数据推导（复用/新增）
+src/                    ← host 层：ABI（engine.cc —— 会话管理 + 九步 generate）、GGUF、分词器、
+                            ChatML、工具解析、元数据推导（复用/新增）
                           + CUDA 计算层（重写）：gpu_model.cu（权重上卡）
                             / kv_cache_gpu.cu（fp16 KV Cache）/ kernels_gpu.cu（算子）
                             / qwen3_gpu.cu（前向 + 增量解码 + 生成循环）
@@ -223,7 +249,8 @@ src/                    ← host 层：ABI、GGUF、分词器、ChatML、工具�
                           ← 另有 sampler.h：**逐字复制**的同源副本（采样参数的语义是契约）
 docs/DESIGN.md          ← 设计决策、阶段判据、对拍策略、与上位仓库的同步方式
 scripts/                ← fetch_model.py（下权重与对拍参考物）
-tests/                  ← check_sync.py（副本有没有跑偏）、abi_smoke.py（ABI 冒烟）、
+tests/                  ← check_sync.py（副本有没有跑偏）、
+                          abi_smoke.py（ABI 冒烟 —— **含一次真实生成**）、
                           run_p1.sh / cmp_layers.py（P1 一键判据）、
                           run_p2.sh / cmp_gen.py（P2 一键判据）、
                           run_p3.sh / cmp_sample.py（P3 一键判据，不需要模型）、

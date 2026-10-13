@@ -134,7 +134,7 @@ decode 阶段每层要发十几个小 kernel（norm / QKV / rope / attention / O
 | **P0** 工具链与骨架 | CMake + CUDA，ABI 层最小实现（version / last_error / load_model / model_info） | 见下面「P0 的判据」 |
 | **P1** 权重上卡 + 前向对拍 | 权重与反量化结果上显存；**整网（无 KV Cache）前向**跑通 | 见下面「P1 的判据」 |
 | **P2** 增量解码对拍 | KV Cache 落地（fp16）、增量解码、贪心采样 | 见下面「P2 的判据」 |
-| **P3** 接入与端到端 | 采样参数（**已完成：设备端实现 + 接进生成循环 + 两条判据**）、工具调用、`rpg_engine.dll` 换进 RPGBar | 采样判据见下面「P3 的判据」；端到端是 `engine_probe.py`、`smoke_test.py`、Unity 侧 P/Invoke 全绿 |
+| **P3** 接入与端到端 | 采样（**已完成**）、**ABI 接入**（**已完成：`Session` 持显存状态 + 九步 `generate`，逐条对齐 CPU 版**）、工具调用、`rpg_engine.dll` 换进 RPGBar | 采样三条判据见下面「P3 的判据」；**ABI 已在 Linux 产物上端到端跑通**（`abi_smoke` **38/0**，多轮对话出文本）；还差 Windows `.dll`（要 MSVC）与 RPGBar 侧联调 |
 | **P4** 性能 | 融合 kernel、量化直算调优、CUDA Graph | 1.7B Q4 上 prefill ≥ 1000 tok/s、decode ≥ 60 tok/s |
 
 > **P1 的判据比"单层"更严，这是有意的**（2026-10-12 实施时定的）：原计划写的是"跑通一层、
@@ -250,7 +250,7 @@ python tests/cmp_gen.py ~/p2-runs/gpu ~/p2-runs/ref --tol 1e-3
 按已生成的序列逐步 `ForwardStep`，并顺带校验重放的 argmax 等于生成时的 token
 （引擎是纯函数，这条本该成立；不成立就先修引擎，别拿这份 logits 去对拍）。
 
-**P3 的判据分两条**，一条不需要模型、一条要模型，**都要有**：
+**P3 的判据分三条** —— 前两条管"算力层"，第三条管"接起来之后"：
 
 ```bash
 # ① 设备端采样本身。**不需要权重、不需要模型**，几秒跑完。
@@ -264,6 +264,10 @@ python tests/cmp_sample.py ~/p3-runs/s --tol 1e-5 --border 1e-6
 
 # ② 采样接进**生成循环**之后的不变量。要权重（1 GiB）。
 bash tests/run_p3_gen.sh
+
+# ③ ABI 端到端：宿主走那 10 个 C 函数。要权重，且会真的上卡。
+python3 tests/abi_smoke.py --lib ~/cuda-build/librpg_engine.so \
+        --model models/Qwen3-1.7B-Q4_K_M.gguf
 ```
 
 **① 设备端采样**（`tools/sample_check.cu` + `tests/cmp_sample.py`）三条：
@@ -340,6 +344,35 @@ E **31/31 逐位相同**。回归：`run_p2.sh` 的逐 token 对拍仍 **32/32**
 满量程仍 **6.48e-4**（**与 P2 记录的数字一模一样** —— 贪心路径确实一位没动）；
 `run_p1.sh` 最差 p99 仍 **1.05e-4**、logits max|Δ| 仍 **1.431e-4**。
 
+**③ ABI 端到端**（`tests/abi_smoke.py` + 一次 `ctypes` 直调，要权重）：
+
+`abi_smoke.py` 只验**宿主看得见的形状** —— 函数调不调得动、返回是不是合法 JSON、
+四个键在不在、`finish_reason` 取值合不合法。**它不验数值**：数值是 ① ② 的活。
+实测 **38 通过 / 0 失败**（P0 时是 32；新增的 6 条全是 `generate`：返回非空 /
+是合法 JSON / 四个键各一条 / `finish_reason` 取值 / `usage` 字段）。
+
+再补一条它覆盖不到的：**真的让模型说话**，并顺带验**多轮前缀复用**（同会话第二次调用）：
+
+```text
+问：用一句话介绍你自己。
+答：我是一个AI助手，可以回答问题、提供信息和协助完成各种任务。   finish=stop
+    usage={'prompt_tokens': 17, 'completion_tokens': 18}
+
+第二轮（同会话，续问「刚才你说了什么？」）：
+答：我刚才说的是一句话，介绍我自己，说我是人工智能助手。
+    usage={'prompt_tokens': 37, 'completion_tokens': 16}   ← 整个 prompt，不是新增段
+```
+
+`prompt_tokens` 报的是**整个 prompt**（与 CPU 版语义一致），而实际前向只跑了新增的
+那一小段 —— "报的数"与"算的数"分开，正是 `usage` 该有的口径。
+
+> ⚠️ 一个**看起来像 bug、其实是对的**现象：`max_tokens` 给得太小时（比如 4），
+> 响应可能是 `text: ""` + `finish_reason: "length"`。原因是 Qwen3 默认**思考模式**，
+> 那 4 个 token 全落在 `<think>` 块里且没闭合，解析器把未闭合的思考块剥掉 ⇒ `text` 为空。
+> `finish_reason` 的两条来源（`unterminated_think` 与"生成数达到上限"）都正确地指向
+> `length`。所以冒烟测试那条断言写的是"**`finish_reason` 是三种之一**"，而不是
+> "必须有非空 `text`" —— **判据得能区分"这是设计"和"这是坏了"**。
+
 ### 性能目标（RTX 5060 Laptop，8 GB，sm_120）
 
 | 指标 | CPU 版实测 | GPU 目标 |
@@ -375,10 +408,10 @@ E **31/31 逐位相同**。回归：`run_p2.sh` 的逐 token 对拍仍 **32/32**
 9. ✅ **argmax**（`GpuArgMax`）：设备端归约，只回传 4 个字节；**并列取最小下标**
    （与 CPU 版 `ArgMax` 的 `x[i] > bv` 同语义 —— 差一个并列规则就会让"逐 token
    一致"的判据红，而那种红会被误读成"数值精度不够"）。
-10. 🔶 **采样**（P3）：temperature / top-k / top-p + counter-based 随机源。
-    **设备端实现、判据、以及接进生成循环都已完成**
+10. ✅ **采样**（P3）：temperature / top-k / top-p + counter-based 随机源。
+    **设备端实现、判据、接进生成循环、以及接进 ABI 都已完成**
     （`src/sampler_gpu.*` + `GpuGenerate` + `tools/sample_check.cu` +
-    `tools/gen_sample_check.cu`，判据见 §5 的「P3 的判据」）；还差把它接进 ABI。
+    `tools/gen_sample_check.cu`，判据见 §5 的「P3 的判据」）。
     生成循环的形态与 CPU 版 `Generate` / `GenerateGreedy` 一一对应：
     **一个 `GpuGenerate` + 一个薄包装**，而不是两份循环（两份只差一行 argmax/sample，
     但"哪个分支忘了处理停止 token"这种漂移迟早会发生）。
@@ -452,7 +485,10 @@ E **31/31 逐位相同**。回归：`run_p2.sh` 的逐 token 对拍仍 **32/32**
    prompt 后冷跑一遍"就该整体错一位相同（实测 31/31 逐位）。
    ⚠️ 这一层的判据**要么严格、要么如实标成概率性**（同 seed 两遍必须严格逐位；
    换 seed 会变、剪枝会改选，这两条就是概率性），不要混成"差不多就行"。
-6. ⏳ **宿主层端到端**（P3）：`smoke_test.py` 全量 + `ui_check.js`，把 dll 换过去跑。
+6. 🔶 **宿主层端到端**（P3）：**Linux 侧已经通了** —— `abi_smoke.py` 38/0 加一次
+   `ctypes` 直调的多轮对话（见 §5 ③）。**还差 Windows**：产物要换成 `rpg_engine.dll`，
+   再跑 RPGBar 的 `smoke_test.py` 全量 + `ui_check.js`。卡点是**编译器**（见 §8 末），
+   不是接口 —— `include/rpg_engine.h` 一个字节没改。
 
 > **判据的参考侧一律是"真的在跑的那一份"**：反量化用从 RPGBarEngine 逐字复制的
 > `quant.cc`，整网用**现场编译出来的** CPU 引擎 `forward_check`（`tools/build_cpu_ref.sh`）。
@@ -477,8 +513,14 @@ E **31/31 逐位相同**。回归：`run_p2.sh` 的逐 token 对拍仍 **32/32**
 | WSL Ubuntu 24.04 | ✓ 13.2 | ✓ | ✓ | — | ✓ `/dev/dxg` + `nvidia-smi` 认卡 |
 
 ⇒ 在 Windows 上编 CUDA **必须同时装 MSVC**（nvcc 不接受 g++ 当宿主编译器），
-而 WSL 只差一个 nvcc、`apt` 就能装。所以定成这样：**P0–P2 的算法验证走 WSL**
-（产物 `librpg_engine.so`），**P3 出货时再补 MSVC + Windows 版 Toolkit** 出 `.dll`。
+而 WSL 只差一个 nvcc、`apt` 就能装。所以定成这样：**P0–P3 的算法验证与 ABI 接入都走 WSL**
+（产物 `librpg_engine.so`），**只差"变成宿主能加载的 `.dll`"这一步时才要补 MSVC +
+Windows 版 Toolkit**。
+
+⚠️ 这条是 **P3 结束时唯一没完成的事**，而它卡住的是**编译器而不是接口**：
+`abi_smoke` 38/0 与那次多轮对话都是在 Linux 产物上跑出来的，`include/rpg_engine.h`
+一个字节没动（`check_sync` 里那两个 ABI 文件仍逐字一致）。换个平台能编出 `.dll`，
+宿主一行不用改 —— 这正是"一个 ABI、两个实现"当初要买的东西。
 
 ⚠️ WSL 通过 9p 访问 `E:\` 的顺序写只有 **173 MB/s**（原生 ext4 是 2.5 GB/s，差 14 倍）。
 所以：源码只留一份（`/mnt/e`，git 管着，Windows 与 WSL 看到的是同一份，不会分叉），
@@ -697,6 +739,49 @@ E counter 用绝对位置（暖缓存 = 冷缓存）                31/31 逐位
    ⇒ 反过来这条也成了一个额外的**布局/位置探测器**：如果哪天 prefill 与 step 的
    求和顺序被改得不一致了，E 会是第一个红的。
 
+**第三步「接入 ABI」全绿**（宿主只调那 10 个 C 函数）：
+
+```text
+abi_smoke.py（CUDA 产物 + 真实权重，WSL）        38 通过 / 0 失败（P0 时 32）
+  ├ 权重上卡    1.05 GiB（量化字节 1.03 GiB）/ 6.6–8.9 s / 设备剩余 5.60 GiB
+  └ 会话 KV     512 容量 ⇒ 56 MiB；1024 ⇒ 112 MiB
+
+端到端多轮（ctypes 直调，同一会话）
+  第 1 轮  问「用一句话介绍你自己。」
+           答「我是一个AI助手，可以回答问题、提供信息和协助完成各种任务。」
+           finish=stop  usage={'prompt_tokens': 17, 'completion_tokens': 18}
+  第 2 轮  问「刚才你说了什么？」
+           答「我刚才说的是一句话，介绍我自己，说我是人工智能助手。」
+           usage={'prompt_tokens': 37, 'completion_tokens': 16}   ← 前缀复用生效
+
+回归：run_p3 192/192 逐位、run_p2 32/32 逐 token + 满量程 6.48e-4、
+      run_p3_gen A–E 全通过（E 31/31）、run_p1 最差 p99 1.05e-4
+      —— 四条判据的数字与记录**一字不差**（ABI 层没碰算力层）
+```
+
+**第三步实施时记下的三点**：
+
+1. **两条实现差异都是"少做事"**：CPU 版 prefill 后要把 `rows × vocab` 的 logits 下载回
+   host 再取最后一行，这里传 `logits = nullptr`，`GpuGenerate` 直接吃 `s->scratch.logits`
+   的**显存地址** —— 整个 decode 循环只回传 4 个字节（采样结果）。另一处是 cache 长度
+   的来源（`GpuKvCache::len()` 而不是自己维护的计数），语义相同、不变量也相同。
+   ⇒ **对齐 CPU 版时，值得逐条问一句"这一句在 GPU 上是不是白做的"**：省掉的搬运不是优化，
+   是接口选对了的副产品。
+2. 🔴 **"模型加载成功"与"能生成"是两件事**，必须分开检查。`load_model` 在**设备完全
+   不可用**时降级成"只读元数据"（P0 就定下的：CI 与无卡机器要能 load、能读 `model_info`），
+   于是 `ModelEntry::gpu` 可能是 `nullptr`；`session_create` 与 `generate` 各自再查一次、
+   给出**不同**的报错。⚠️ 但**设备可用而上传失败**（OOM、未知量化类型……）**必须抛** ——
+   静默降级会让宿主以为"加载成功了"，然后在生成时收到一条完全看不懂的报错。
+3. **"断言未来行为"的测试会过期**。`abi_smoke.py` 里 P0 时代写的那句
+   "generate 尚未实现 ⇒ 返回 NULL"在 P3 之后必然失效 —— 它必须**在同一次改动里**被改掉，
+   否则会变成一道"只有实现退化时才通过"的假绿灯。**写这类断言时，顺手记一句"什么时候该来改它"。**
+
+> 一处**看起来像 bug、其实是对的**：`max_tokens = 4` 时响应是 `text: ""` +
+> `finish_reason: "length"`。Qwen3 默认思考模式，那 4 个 token 全在 `<think>` 里没闭合，
+> 解析器把未闭合的思考块剥掉 ⇒ `text` 为空。两条 `finish_reason` 的来源
+> （`unterminated_think`、生成数达上限）都正确指向 `length`。所以冒烟测试的断言写的是
+> "`finish_reason` 是三种之一"，而不是"`text` 必须非空"——**判据得能区分"设计"与"坏了"。**
+
 ## 9. 已知风险
 
 1. **sm_120 是新架构**。CUDA 12.8 之前根本没有它的 target；工具链版本选错会得到
@@ -707,6 +792,14 @@ E counter 用绝对位置（暖缓存 = 冷缓存）                31/31 逐位
    跑了多久、温度多少。
 4. **`quant.cc` 是 host 侧复用的**，GPU 侧反量化必须**另写**并独立对拍（§7.1），
    不能"看着公式一样"就跳过。
+5. **Windows 产物还没有编出来**（P3 唯一的遗留项）：nvcc 在 Windows 上只认 `cl.exe`，
+   而这台机器没有 VS/MSVC ⇒ 宿主的 `models/rpg_engine.dll` 现在仍是 CPU 版，
+   RPGBar 的 `smoke_test.py` / `ui_check.js` 还没在 CUDA 引擎上跑过。**接口层已经验过了**
+   （Linux 产物 38/0 + 多轮对话），要补的只是工具链。
+6. **进程退出前必须 `unload_model`**：两个注册表（`g_models` / `g_sessions`）是命名空间级
+   静态对象，会话与模型里装着 `DeviceBuffer`，它们的析构会调 `cudaFree` —— 拖到进程退出
+   才析构时，CUDA 上下文可能已经不在了。宿主正常路径（`abi_smoke.py` 也是）都会显式
+   unload，所以这条是"**别写错宿主**"的提醒，不是引擎的缺陷。
 
 ## 10. 与 RPGBarEngine 的同步
 
