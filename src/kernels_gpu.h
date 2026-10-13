@@ -1,4 +1,4 @@
-// kernels_gpu.h —— 显存上的算子（host 侧的启动入口）
+﻿// kernels_gpu.h —— 显存上的算子（host 侧的启动入口）
 //
 // 与 CPU 版 src/kernels.h + matmul.h 是**同一个抽象层级**：一条向量进、一条
 // 向量出，不暴露布局细节。区别是这里的实现在 .cu 里、跑在显存上。

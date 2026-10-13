@@ -1,4 +1,4 @@
-// RPGBarEngine —— ggml 量化类型表与反量化
+﻿// RPGBarEngine —— ggml 量化类型表与反量化
 //
 // GGUF 里一个张量可以是 fp 类型（F32/F16/BF16），也可以是分块量化类型
 // （Q4_0 … Q8_0，以及 K-quant 家族的 Q2_K … Q6_K）。反量化算法按 ggml

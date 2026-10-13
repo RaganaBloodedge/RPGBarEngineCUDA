@@ -1,4 +1,4 @@
-// RPGBarEngineCUDA —— 显存里的模型（权重 + 配置 + RoPE 表）
+﻿// RPGBarEngineCUDA —— 显存里的模型（权重 + 配置 + RoPE 表）
 //
 // 职责边界与 CPU 版的 src/model.cc 一样："把 GGUF 变成一堆可用的权重 + 一份
 // 配置"，不含任何前向逻辑（前向在 qwen3_gpu.cu）。**但实现是重写的**，原因不是

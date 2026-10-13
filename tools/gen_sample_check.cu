@@ -1,4 +1,4 @@
-// gen_sample_check —— P3 第二条判据：**采样在真实生成循环里**。
+﻿// gen_sample_check —— P3 第二条判据：**采样在真实生成循环里**。
 //
 // 与第一条（tools/sample_check）的分工：
 //   * sample_check 把模型**摘掉**，验"同一份 logits + 同一个 seed ⇒ 同一个 token"

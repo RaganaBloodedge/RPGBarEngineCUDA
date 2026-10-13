@@ -1,4 +1,4 @@
-// cuda_common.h —— CUDA 侧公共设施：错误检查、设备信息、显存 RAII。
+﻿// cuda_common.h —— CUDA 侧公共设施：错误检查、设备信息、显存 RAII。
 //
 // 这一层刻意做得薄：**所有 CUDA 调用都过 RPG_CUDA_CHECK**，失败就抛 rpg::Error，
 // 由 ABI 边界（engine.cc）统一翻成"负数/NULL + rpg_engine_last_error()"。

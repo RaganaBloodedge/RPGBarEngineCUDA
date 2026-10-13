@@ -1,4 +1,4 @@
-// RPGBarEngine —— GGUF 读取
+﻿// RPGBarEngine —— GGUF 读取
 //
 // 按 ggml 的 docs/gguf.md（v3）实现，兼容 v1/v2（唯一差别：v1 的头里两个计数
 // 是 uint32，v2/v3 是 uint64）。

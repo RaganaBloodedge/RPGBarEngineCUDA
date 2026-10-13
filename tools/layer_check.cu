@@ -1,4 +1,4 @@
-// layer_check —— P1 的判据工具：在 GPU 上跑整段前向，把结果写成 npy。
+﻿// layer_check —— P1 的判据工具：在 GPU 上跑整段前向，把结果写成 npy。
 //
 // 输出与 CPU 引擎的 tools/forward_check **同名同形状**（<前缀>.hidden.npy
 // [n_layers+1, seq, hidden] / <前缀>.logits.npy [seq, vocab]），所以对拍是：

@@ -1,4 +1,4 @@
-// RPGBarEngine —— 最小 JSON
+﻿// RPGBarEngine —— 最小 JSON
 //
 // 用在哪：引擎自己的输入输出全是 JSON ——
 //   * 宿主传进来的 config_json / request_json（messages + tools + 采样参数）；

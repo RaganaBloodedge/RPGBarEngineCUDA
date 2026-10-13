@@ -1,4 +1,4 @@
-// kv_cache_gpu.h —— 显存里的 KV Cache（fp16）
+﻿// kv_cache_gpu.h —— 显存里的 KV Cache（fp16）
 //
 // 与 CPU 版 src/kv_cache.h 的对应关系：**布局照搬，元素类型与存放位置不同**。
 //   CPU 版：[n_layers, n_kv_heads, max_seq, head_dim]，host 内存，fp32

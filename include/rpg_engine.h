@@ -1,4 +1,4 @@
-/* rpg_engine.h —— RPGBar 内置推理引擎的 C ABI。
+﻿/* rpg_engine.h —— RPGBar 内置推理引擎的 C ABI。
  *
  * 只暴露 C 接口，不暴露任何 C++ 类型，避免不同编译器 / STL 版本之间的 ABI 问题。
  * 宿主侧：Unity C#（P/Invoke）、Python（ctypes）都能直接绑定。

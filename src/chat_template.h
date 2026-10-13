@@ -1,4 +1,4 @@
-// RPGBarEngine —— Qwen3 的 ChatML 模板（渲染方向）
+﻿// RPGBarEngine —— Qwen3 的 ChatML 模板（渲染方向）
 //
 // 只做 Qwen3 这一个模板，**不引入 Jinja2**：宿主的工具定义、消息历史要渲染成
 // 一段确定的字符串，模板本身是固定的，引一个通用模板引擎只会多一份依赖与

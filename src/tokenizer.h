@@ -1,4 +1,4 @@
-// RPGBarEngine —— 分词器（Qwen 的 BBPE）
+﻿// RPGBarEngine —— 分词器（Qwen 的 BBPE）
 //
 // Qwen3 用的是 GPT-2 风格的 **byte-level BPE**，词表与 merges 都从 GGUF 里读
 // （tokenizer.ggml.tokens / tokenizer.ggml.merges / tokenizer.ggml.token_type）。

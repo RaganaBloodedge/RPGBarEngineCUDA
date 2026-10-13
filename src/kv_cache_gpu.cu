@@ -1,4 +1,4 @@
-// kv_cache_gpu.cu —— 显存 KV Cache 的实现（见 kv_cache_gpu.h 的说明）
+﻿// kv_cache_gpu.cu —— 显存 KV Cache 的实现（见 kv_cache_gpu.h 的说明）
 
 #include "kv_cache_gpu.h"
 

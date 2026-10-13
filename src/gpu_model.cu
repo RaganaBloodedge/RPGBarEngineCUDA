@@ -1,4 +1,4 @@
-// gpu_model.cu —— 把 GGUF 的权重搬到显存（见 gpu_model.h 里的设计说明）。
+﻿// gpu_model.cu —— 把 GGUF 的权重搬到显存（见 gpu_model.h 里的设计说明）。
 
 #include "gpu_model.h"
 

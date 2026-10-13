@@ -1,4 +1,4 @@
-// qwen3_gpu.cu —— Qwen3 前向的实现（见 qwen3_gpu.h 的说明）
+﻿// qwen3_gpu.cu —— Qwen3 前向的实现（见 qwen3_gpu.h 的说明）
 
 #include "qwen3_gpu.h"
 

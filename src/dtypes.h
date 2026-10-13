@@ -1,4 +1,4 @@
-// RPGBarEngine —— 元素类型与 f32 转换
+﻿// RPGBarEngine —— 元素类型与 f32 转换
 //
 // 与 TinyGemmaCpp 的 dtypes.h 同源（bf16 那部分逐行沿用），但有两处不同：
 //   1. 加了 **f16**（GGUF 的量化块 scale 是 fp16；BF16 模型也走 f16 路径）。

@@ -1,4 +1,4 @@
-// RPGBarEngineCUDA —— GGUF 元数据 → 形状与超参。**整个仓库只有这一份推导。**
+﻿// RPGBarEngineCUDA —— GGUF 元数据 → 形状与超参。**整个仓库只有这一份推导。**
 //
 // 为什么专门开一个文件：这份 Q4_K_M 权重里，形状错了不会崩，只会**静默算错**。
 // 典型的一条是 head_dim —— Qwen3-1.7B 上 `hidden/n_heads = 2048/16 = 128` 恰好

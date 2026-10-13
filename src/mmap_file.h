@@ -1,4 +1,4 @@
-// RPGBarEngine —— 只读内存映射文件
+﻿// RPGBarEngine —— 只读内存映射文件
 //
 // 为什么必须 mmap，而不是 fread 到 vector：
 //   * Q8_0 的 1.7B 权重 1.8 GB，Q4_K_M 也 1.1 GB。整份读进堆会让进程峰值翻倍

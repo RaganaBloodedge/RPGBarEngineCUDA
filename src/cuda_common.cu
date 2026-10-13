@@ -1,4 +1,4 @@
-// cuda_common.cu —— CUDA 侧的实现（错误检查、显存 RAII、设备查询）。
+﻿// cuda_common.cu —— CUDA 侧的实现（错误检查、显存 RAII、设备查询）。
 //
 // ⚠️ 这个文件**只有装了 CUDA Toolkit 才参与编译**。所以这里可以放心直接用
 // cuda_runtime 的类型与 API，不需要到处 #ifdef —— 与 CUDA 无关的部分（描述

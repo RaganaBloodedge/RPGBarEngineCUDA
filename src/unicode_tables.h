@@ -1,4 +1,4 @@
-// 本文件由 tools/gen_unicode_tables.py 生成，请勿手改。
+﻿// 本文件由 tools/gen_unicode_tables.py 生成，请勿手改。
 // 重新生成：python tools/gen_unicode_tables.py > src/unicode_tables.h
 // 数据来源：Python unicodedata（Unicode 15.1.0）
 

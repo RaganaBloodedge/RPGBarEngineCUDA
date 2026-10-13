@@ -1,4 +1,4 @@
-// RPGBarEngine —— Unicode 小工具
+﻿// RPGBarEngine —— Unicode 小工具
 //
 // 只做三件事，但每件都必须精确：
 //   1. UTF-8 编解码（不依赖 locale、不用 std::wstring_convert）；

@@ -1,4 +1,4 @@
-// sampler_gpu.cu —— 采样的设备端实现（P3）。接口与理由见 sampler_gpu.h。
+﻿// sampler_gpu.cu —— 采样的设备端实现（P3）。接口与理由见 sampler_gpu.h。
 //
 // 一个 kernel 干完"确定性的一半"（FilterProbsKernel），另一个（一个线程的）
 // 干完"逆变换"。为什么逆变换不并行，见 InverseSampleKernel 的头注释。

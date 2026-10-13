@@ -1,4 +1,4 @@
-// RPGBarEngineCUDA —— 设备端反量化（F32 / Q4_K / Q6_K）
+﻿// RPGBarEngineCUDA —— 设备端反量化（F32 / Q4_K / Q6_K）
 //
 // ⚠️ 这个头**只许被 .cu include**（里面有 __device__ 函数）。host 侧（.cc）要用
 // 反量化请用 src/quant.cc 的 DequantizeRow —— 那是同源复制来的标量参考实现。

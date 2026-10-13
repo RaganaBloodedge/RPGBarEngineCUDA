@@ -1,4 +1,4 @@
-// qwen3_gpu.h —— Qwen3 前向（显存版）
+﻿// qwen3_gpu.h —— Qwen3 前向（显存版）
 //
 // 与 CPU 版 src/qwen3.h 的对应关系：**结构照搬，实现重写**。
 //   * ForwardFull（整段前向，可带 cache）→ GpuForwardFull

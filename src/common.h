@@ -1,4 +1,4 @@
-// RPGBarEngine —— 基础设施：错误、日志、断言
+﻿// RPGBarEngine —— 基础设施：错误、日志、断言
 //
 // 错误策略：
 //   * 引擎内部用异常传错误（RPG_THROW / RPG_CHECK），因为调用链深、需要中途返回。

@@ -1,4 +1,4 @@
-// RPGBarEngine —— 采样：确定性筛选 + counter-based 随机源
+﻿// RPGBarEngine —— 采样：确定性筛选 + counter-based 随机源
 //
 // 引擎里**没有有状态的随机数生成器**（DESIGN §12 #6）。这个文件把采样拆成
 // 两半，各自都能单独验证：
