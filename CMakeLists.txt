@@ -11,7 +11,26 @@ endif()
 
 if(MSVC)
   # /fp:precise 关掉浮点收缩 —— 与下面的 -ffp-contract=off 同一个目的（见注释）。
-  add_compile_options(/O2 /utf-8 /fp:precise)
+  # ⚠️ 这些是 **MSVC 风格**开关，只给 host（CXX）。裸的 /O2 落到 nvcc 上会被当成
+  # **输入文件**（Windows 上 "/" 也是路径分隔符），于是报
+  #   nvcc fatal : A single input file is required for a non-link phase
+  #   when an outputfile is specified
+  # —— 与下面 else() 分支里 -O2 那个坑同源，只是触发方式不同。
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:/O2>
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CXX>:/fp:precise>)
+  # CUDA 侧**不要**传 -Xcompiler=/utf-8：实测它反而会破坏 nvcc 编译 —— 带 BOM 的
+  # 文件会报 "missing closing quote"（因为 nvcc 只认 BOM，见下一条）。
+  #
+  # .cu / .cuh 里的中文靠**文件自身的 UTF-8 BOM** 解决。原因：nvcc 在 Windows 上
+  # 按本地代码页（936）读源文件，而它**只认 BOM** ——
+  #   * nvcc 的 -utf-8 选项无效（只管 execution charset，实测同样报错）；
+  #   * /utf-8 只能通过 -Xcompiler 给 host 编译器，管不到 nvcc 自己的词法器；
+  #   * chcp 65001 无效。
+  # 不加 BOM 时中文会按 GBK 解读，某些字节序列产生假的 "\"，把字符串的结束引号
+  # 转义掉 ⇒ "missing closing quote"，且错误会**连锁**到后面几十行。
+  # ⚠️ 只有**中文字符串字面量**会炸；纯中文注释无害（预处理阶段就被剥离了）。
 else()
   # -O2 只给 host（CXX）。**别让它也落到 CUDA 上**：Release 下 CMake 会给
   # nvcc 传 -O3（CMAKE_CUDA_FLAGS_RELEASE），再叠一个 -O2 会得到
