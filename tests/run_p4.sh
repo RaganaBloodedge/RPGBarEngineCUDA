@@ -66,12 +66,22 @@ echo "=============================================================="
 # 报表要把"这组数是在什么上、什么时候量的"钉住（DESIGN §9.3）：换一张卡、
 # 换一版驱动，这些数就不该被拿来互相比。温度只作参考 —— 笔记本 GPU 长时间
 # 跑会被功耗墙压下来，那是"机器热了"，不是"代码变慢了"。
+#
+# ⚠️ WSL 里 nvidia-smi 在 /usr/lib/wsl/lib/，**不在默认 PATH 上**（而且这个
+# 脚本自己 export 过一个精简 PATH，更找不到）⇒ 显式往那里找一下。
+SMI="$(command -v nvidia-smi || true)"
+if [ -z "$SMI" ] && [ -x /usr/lib/wsl/lib/nvidia-smi ]; then
+  SMI=/usr/lib/wsl/lib/nvidia-smi
+fi
+gpu_line() {
+  [ -n "$SMI" ] || return 0
+  "$SMI" --query-gpu=name,driver_version,temperature.gpu,clocks.sm,power.draw \
+         --format=csv,noheader 2>/dev/null | sed "s/^/$1/" || true
+}
+
 echo "date : $(date -Iseconds)"
 echo "build: $BUILD"
-if command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi --query-gpu=name,driver_version,temperature.gpu,clocks.sm,power.draw \
-             --format=csv,noheader 2>/dev/null | sed 's/^/gpu  : /' || true
-fi
+gpu_line "gpu  : "
 echo
 "$BUILD/graph_check" "$MODEL" --prompt-file "$PROMPT" \
   --max-tokens "$MAXTOK" --chunks "$CHUNKS" --bench-tokens "$BENCH" \
@@ -79,10 +89,7 @@ echo
 status="${PIPESTATUS[0]}"
 
 echo
-if command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi --query-gpu=temperature.gpu,clocks.sm,power.draw \
-             --format=csv,noheader 2>/dev/null | sed 's/^/gpu after run: /' || true
-fi
+gpu_line "gpu after run: "
 echo "date : $(date -Iseconds)"
 if [ "$status" -eq 0 ]; then
   echo "P4 的 CUDA Graph 判据全部通过。"
