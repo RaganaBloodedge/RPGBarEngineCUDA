@@ -27,7 +27,7 @@ std::string CudaVersionString(int v) {
 }  // namespace
 
 void ThrowCudaError(cudaError_t err, const char* expr, const char* file, int line) {
-  Throw("CUDA 调用失败：%s\n  表达式：%s\n  位置：%s:%d",
+  Throw("CUDA call failed: %s\n  expression: %s\n  at: %s:%d",
         cudaGetErrorString(err), expr, file, line);
 }
 
@@ -51,7 +51,7 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& o) noexcept {
 
 void DeviceBuffer::Alloc(size_t bytes) {
   // 0 字节的 cudaMalloc 返回的指针不可靠，也说明调用方算错了尺寸 —— 早失败。
-  RPG_CHECK(bytes > 0, "DeviceBuffer::Alloc 收到 0 字节");
+  RPG_CHECK(bytes > 0, "DeviceBuffer::Alloc got 0 bytes");
   Free();
   RPG_CUDA_CHECK(cudaMalloc(&ptr_, bytes));
   bytes_ = bytes;
@@ -63,24 +63,24 @@ void DeviceBuffer::Free() {
   // UB）—— cudaFree 失败只记日志。实践中它只在上下文已销毁时失败。
   const cudaError_t e = cudaFree(ptr_);
   if (e != cudaSuccess) {
-    RPG_LOG_WARN("cudaFree 失败（上下文可能已销毁）：%s", cudaGetErrorString(e));
+    RPG_LOG_WARN("cudaFree failed (the context may already be destroyed): %s", cudaGetErrorString(e));
   }
   ptr_ = nullptr;
   bytes_ = 0;
 }
 
 void DeviceBuffer::Upload(const void* src, size_t bytes) {
-  RPG_CHECK(ptr_ != nullptr, "DeviceBuffer::Upload 在未分配时被调用");
+  RPG_CHECK(ptr_ != nullptr, "DeviceBuffer::Upload called on an unallocated buffer");
   RPG_CHECK(bytes <= bytes_,
-            "DeviceBuffer::Upload 溢出：上传 " RPG_SZ " 字节到 " RPG_SZ " 字节的缓冲",
+            "DeviceBuffer::Upload overflow: uploading " RPG_SZ " bytes into a " RPG_SZ "-byte buffer",
             RPG_SZ_ARG(bytes), RPG_SZ_ARG(bytes_));
   RPG_CUDA_CHECK(cudaMemcpy(ptr_, src, bytes, cudaMemcpyHostToDevice));
 }
 
 void DeviceBuffer::Download(void* dst, size_t bytes) const {
-  RPG_CHECK(ptr_ != nullptr, "DeviceBuffer::Download 在未分配时被调用");
+  RPG_CHECK(ptr_ != nullptr, "DeviceBuffer::Download called on an unallocated buffer");
   RPG_CHECK(bytes <= bytes_,
-            "DeviceBuffer::Download 溢出：下载 " RPG_SZ " 字节自 " RPG_SZ " 字节的缓冲",
+            "DeviceBuffer::Download overflow: downloading " RPG_SZ " bytes from a " RPG_SZ "-byte buffer",
             RPG_SZ_ARG(bytes), RPG_SZ_ARG(bytes_));
   RPG_CUDA_CHECK(cudaMemcpy(dst, ptr_, bytes, cudaMemcpyDeviceToHost));
 }
@@ -93,22 +93,22 @@ DeviceInfo QueryDevice(int index) {
   int count = 0;
   const cudaError_t e = cudaGetDeviceCount(&count);
   if (e != cudaSuccess) {
-    d.reason = std::string("cudaGetDeviceCount 失败：") + cudaGetErrorString(e);
+    d.reason = std::string("cudaGetDeviceCount failed: ") + cudaGetErrorString(e);
     return d;
   }
   if (count <= 0) {
-    d.reason = "没有检测到 CUDA 设备（显卡不支持 / 驱动太旧 / 是纯 CPU 机器）";
+    d.reason = "no CUDA device found (unsupported GPU / out-of-date driver / CPU-only machine)";
     return d;
   }
   if (index < 0 || index >= count) {
-    d.reason = "设备下标越界（共 " + std::to_string(count) + " 个设备）";
+    d.reason = "device index out of range (there are " + std::to_string(count) + " devices)";
     return d;
   }
 
   cudaDeviceProp p{};
   const cudaError_t pe = cudaGetDeviceProperties(&p, index);
   if (pe != cudaSuccess) {
-    d.reason = std::string("cudaGetDeviceProperties 失败：") + cudaGetErrorString(pe);
+    d.reason = std::string("cudaGetDeviceProperties failed: ") + cudaGetErrorString(pe);
     return d;
   }
 

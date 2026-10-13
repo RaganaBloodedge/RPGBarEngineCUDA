@@ -30,9 +30,9 @@ void CheckGpuType(const GgufTensor& t) {
     case kGgmlQ6_K:
       return;
     default:
-      Throw("张量 %s 的类型是 %s，CUDA 后端（当前）只实现了 F32 / Q4_K / Q6_K。"
-            "要么换一份量化档位（Q4_K_M / Q5_K_M 里的 Q4_K+Q6_K 组合是支持的），"
-            "要么等后续阶段补上这个类型。",
+      Throw("tensor %s has type %s; the CUDA backend implements only F32 / Q4_K / Q6_K so far. "
+            "Use a quantization it does support (the Q4_K+Q6_K pair used by Q4_K_M / Q5_K_M), "
+            "or wait for this type to be implemented in a later stage.",
             t.name.c_str(), TypeName(t.type));
   }
 }
@@ -58,7 +58,7 @@ GpuTensor GpuModel::UploadMatrix(const GgufTensor& t) {
 
 GpuTensor GpuModel::ImportNorm(const GgufTensor& t) {
   CheckGpuType(t);
-  RPG_CHECK(t.dims.size() == 1, "张量 %s 期望 1 维 norm 权重，实际 %lld 维",
+  RPG_CHECK(t.dims.size() == 1, "tensor %s should be a 1-D norm weight, got %lld dims",
             t.name.c_str(), static_cast<long long>(t.dims.size()));
   GpuTensor g;
   g.type = kGgmlF32;  // 上传后统一按 f32 用
@@ -71,12 +71,12 @@ GpuTensor GpuModel::ImportNorm(const GgufTensor& t) {
   if (t.type == kGgmlF32) {
     // norm 在 GGUF 里就是 F32（量化工具会刻意留成 F32 —— 它参与每一次归一化，
     // 量化误差会被逐层放大）。这里不做逐元素转换，直接把字节搬上去。
-    RPG_CHECK(t.n_bytes == t.n_elements * 4, "norm %s 的字节数与元素数不符",
+    RPG_CHECK(t.n_bytes == t.n_elements * 4, "norm %s: byte count does not match element count",
               t.name.c_str());
     g.buf.Upload(gguf_.TensorBytes(t), static_cast<size_t>(t.n_bytes));
   } else {
     // 少数 GGUF 会把 norm 也量化。支持它，但留日志 —— 精度有损，出现即异常。
-    RPG_LOG_WARN("norm 权重 %s 是 %s，已反量化（精度略有损失）", t.name.c_str(),
+    RPG_LOG_WARN("norm weight %s is %s; dequantized (slight precision loss)", t.name.c_str(),
                  TypeName(t.type));
     std::vector<float> tmp(static_cast<size_t>(t.n_elements));
     gguf_.DequantizeTo(t, tmp.data());
@@ -114,7 +114,7 @@ void GpuModel::BuildRopeTable(int32_t max_pos) {
 
   rope_.Alloc(rope.size() * sizeof(float));
   rope_.Upload(rope.data(), rope.size() * sizeof(float));
-  RPG_LOG_INFO("RoPE 表已上传显存：%lld 个位置 × head_dim %d（%.1f MiB）",
+  RPG_LOG_INFO("RoPE table uploaded to device: %lld positions x head_dim %d (%.1f MiB)",
                static_cast<long long>(n_rope_pos_), cfg_.head_dim,
                static_cast<double>(rope_.size()) / (1024.0 * 1024.0));
 }
@@ -124,7 +124,7 @@ void GpuModel::BuildRopeTable(int32_t max_pos) {
 const GgufTensor& GpuModel::Require(const std::string& name) const {
   const GgufTensor* t = gguf_.Find(name);
   if (!t) {
-    Throw("GGUF 里找不到张量 %s（架构 %s，共 %lld 个张量）", name.c_str(),
+    Throw("tensor %s not found in the GGUF (arch %s, %lld tensors in total)", name.c_str(),
           cfg_.arch.c_str(), static_cast<long long>(gguf_.tensors().size()));
   }
   return *t;
@@ -136,10 +136,10 @@ void GpuModel::CheckShape(const GgufTensor& t, int64_t rows, int64_t cols) const
     std::snprintf(got, sizeof(got), "[%lld,%lld]", static_cast<long long>(t.rows()),
                   static_cast<long long>(t.cols()));
     if (!t.is_matrix()) {
-      std::snprintf(got, sizeof(got), "%lld 维，不是矩阵",
+      std::snprintf(got, sizeof(got), "%lld dims, not a matrix",
                     static_cast<long long>(t.dims.size()));
     }
-    Throw("张量 %s 形状不符：期望 [%lld,%lld]（行×列），实际 %s", t.name.c_str(),
+    Throw("tensor %s has the wrong shape: expected [%lld,%lld] (rows x cols), got %s", t.name.c_str(),
           static_cast<long long>(rows), static_cast<long long>(cols), got);
   }
   CheckGpuType(t);
@@ -149,11 +149,11 @@ GpuModel GpuModel::Load(const std::string& path, int32_t max_pos) {
   GpuModel m;
   const DeviceInfo dev = QueryDevice(0);
   if (!dev.available) {
-    Throw("没有可用的 CUDA 设备，无法把权重搬上显存：%s", dev.reason.c_str());
+    Throw("no usable CUDA device, cannot upload the weights: %s", dev.reason.c_str());
   }
 
   m.gguf_ = GgufFile::Open(path);
-  RPG_CHECK(m.gguf_.valid(), "GGUF 打不开：%s", path.c_str());
+  RPG_CHECK(m.gguf_.valid(), "cannot open the GGUF: %s", path.c_str());
 
   // 形状/超参只推一次，且与 engine.cc / model_info 用的是同一处（model_meta.h）。
   m.cfg_ = ReadModelMeta(m.gguf_);
@@ -164,7 +164,7 @@ GpuModel GpuModel::Load(const std::string& path, int32_t max_pos) {
   // 两者必须相等 —— 不等就是权重和分词器不是一套，而不等的结果是"能出 id
   // 但查不到词"，很难归因。这里一次性钉死。
   RPG_CHECK(static_cast<int32_t>(m.tokenizer_.vocab_size()) == c.vocab,
-            "分词器词表 %lld 与 token_embd 行数 %d 不一致（权重与分词器不是一套）",
+            "tokenizer vocab %lld does not match the %d rows of token_embd (weights and tokenizer are not a matched pair)",
             static_cast<long long>(m.tokenizer_.vocab_size()), c.vocab);
 
   const auto t_begin = std::chrono::steady_clock::now();
@@ -183,7 +183,7 @@ GpuModel GpuModel::Load(const std::string& path, int32_t max_pos) {
   // 白扔一份没有意义。lm_head() 在 tied 时直接返回 token_embd_。
 
   const GgufTensor& on = m.Require("output_norm.weight");
-  RPG_CHECK(on.n_elements == c.hidden, "output_norm 长度 %lld != hidden %d",
+  RPG_CHECK(on.n_elements == c.hidden, "output_norm length %lld != hidden %d",
             static_cast<long long>(on.n_elements), c.hidden);
   m.output_norm_ = m.ImportNorm(on);
 
@@ -234,11 +234,11 @@ GpuModel GpuModel::Load(const std::string& path, int32_t max_pos) {
   const auto t_end = std::chrono::steady_clock::now();
   const double sec = std::chrono::duration<double>(t_end - t_begin).count();
   const DeviceInfo after = QueryDevice(0);
-  RPG_LOG_INFO("权重已上卡：%s（%d 层 / hidden %d / 词表 %d / tied=%s）",
+  RPG_LOG_INFO("weights on device: %s (%d layers / hidden %d / vocab %d / tied=%s)",
                c.name.c_str(), c.n_layers, c.hidden, c.vocab,
-               c.tied_embeddings ? "是" : "否");
-  RPG_LOG_INFO("  显存占用 %.2f GiB（量化字节 %.2f GiB）/ 上传用时 %.1f s"
-               " / 设备剩余 %.2f GiB",
+               c.tied_embeddings ? "yes" : "no");
+  RPG_LOG_INFO("  device memory %.2f GiB (quantized bytes %.2f GiB) / upload took %.1f s"
+               " / %.2f GiB free on device",
                static_cast<double>(m.device_bytes()) / (1024.0 * 1024.0 * 1024.0),
                static_cast<double>(c.weight_bytes) / (1024.0 * 1024.0 * 1024.0),
                sec, static_cast<double>(after.free_mem) / (1024.0 * 1024.0 * 1024.0));
@@ -271,26 +271,26 @@ std::string GpuModel::Describe() const {
   const DeviceInfo d = QueryDevice(0);
   // 注意别把临时 std::string 的 c_str() 塞进三元里 —— 那种写法在多数编译器上
   // 恰好能活到函数调用结束，但看着就不安全。
-  const std::string dev = d.available ? d.name : ("无设备（" + d.reason + "）");
+  const std::string dev = d.available ? d.name : ("no device (" + d.reason + ")");
   char buf[768];
   std::snprintf(
       buf, sizeof(buf),
-      "%s（%s）\n"
-      "  规模      : %d 层 / hidden %d / ffn %d\n"
-      "  注意力    : %d Q 头 / %d KV 头 / head_dim %d（每组 %d 个 Q 头）\n"
-      "  词表      : %d\n"
-      "  位置编码  : RoPE theta=%.6g，表覆盖 %lld 个位置（上限 %d）\n"
-      "  归一化    : RMSNorm eps=%.3g\n"
-      "  输出头    : %s\n"
-      "  量化字节  : %lld（%.2f GiB）\n"
-      "  显存占用  : %lld（%.2f GiB）\n"
-      "  设备      : %s\n",
+      "%s (%s)\n"
+      "  size       : %d layers / hidden %d / ffn %d\n"
+      "  attention  : %d Q heads / %d KV heads / head_dim %d (%d Q heads per group)\n"
+      "  vocab      : %d\n"
+      "  position   : RoPE theta=%.6g, table covers %lld positions (max %d)\n"
+      "  norm       : RMSNorm eps=%.3g\n"
+      "  output     : %s\n"
+      "  quantized  : %lld bytes (%.2f GiB)\n"
+      "  device mem : %lld bytes (%.2f GiB)\n"
+      "  device     : %s\n",
       cfg_.name.c_str(), cfg_.arch.c_str(), cfg_.n_layers, cfg_.hidden,
       cfg_.intermediate, cfg_.n_heads, cfg_.n_kv_heads, cfg_.head_dim,
       cfg_.heads_per_kv(), cfg_.vocab, cfg_.rope_theta,
       static_cast<long long>(n_rope_pos_), cfg_.context_length,
       static_cast<double>(cfg_.rms_eps),
-      cfg_.tied_embeddings ? "与 token_embd 共享（tied）" : "独立 output.weight",
+      cfg_.tied_embeddings ? "shared with token_embd (tied)" : "separate output.weight",
       static_cast<long long>(cfg_.weight_bytes),
       static_cast<double>(cfg_.weight_bytes) / (1024.0 * 1024.0 * 1024.0),
       static_cast<long long>(device_bytes()),

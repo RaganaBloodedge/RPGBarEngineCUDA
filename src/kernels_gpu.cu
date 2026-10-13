@@ -54,7 +54,7 @@ struct BlockShape {
 
 BlockShape ShapeOf(uint32_t type) {
   const GgmlTypeInfo* t = TypeInfo(type);
-  RPG_CHECK(t != nullptr, "未知的 ggml 类型 id=%u", type);
+  RPG_CHECK(t != nullptr, "unknown ggml type id=%u", type);
   return BlockShape{static_cast<int32_t>(t->block_elems),
                     static_cast<int32_t>(t->block_bytes)};
 }
@@ -64,7 +64,7 @@ BlockShape ShapeOf(uint32_t type) {
 void CheckLaunch(const char* what) {
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) {
-    Throw("kernel 启动失败（%s）：%s", what, cudaGetErrorString(e));
+    Throw("kernel launch failed (%s): %s", what, cudaGetErrorString(e));
   }
 }
 
@@ -462,7 +462,7 @@ __global__ void EmbeddingLookupKernel(uint32_t type, const uint8_t* emb,
 // 一类可以一次性消除的 bug。
 unsigned GridFor(int64_t n, int threads) {
   const int64_t g = (n + threads - 1) / threads;
-  RPG_CHECK(g > 0 && g <= 0x7FFFFFFF, "grid 维度越界：%lld", (long long)g);
+  RPG_CHECK(g > 0 && g <= 0x7FFFFFFF, "grid dimension out of range: %lld", (long long)g);
   return static_cast<unsigned>(g);
 }
 
@@ -473,7 +473,7 @@ unsigned GridFor(int64_t n, int threads) {
 void GpuDequantRow(uint32_t type, const uint8_t* src_dev, int64_t n_elems,
                    float* dst_dev) {
   const BlockShape bs = ShapeOf(type);
-  RPG_CHECK(n_elems % bs.elems == 0, "反量化长度 %lld 不是块大小 %d 的整数倍",
+  RPG_CHECK(n_elems % bs.elems == 0, "dequant length %lld is not a multiple of the block size %d",
             static_cast<long long>(n_elems), bs.elems);
   DequantRowKernel<<<GridFor(n_elems, 256), 256>>>(type, src_dev, n_elems,
                                                    bs.elems, bs.bytes, dst_dev);
@@ -482,13 +482,13 @@ void GpuDequantRow(uint32_t type, const uint8_t* src_dev, int64_t n_elems,
 
 void GpuMatMulQuant(const GpuTensor& w, const float* X_dev, int64_t n_tokens,
                     float* OUT_dev) {
-  RPG_CHECK(w.matrix, "GpuMatMulQuant 收到非矩阵张量（%s）", w.type_name());
-  RPG_CHECK(n_tokens > 0, "n_tokens 必须为正");
+  RPG_CHECK(w.matrix, "GpuMatMulQuant got a non-matrix tensor (%s)", w.type_name());
+  RPG_CHECK(n_tokens > 0, "n_tokens must be positive");
   const BlockShape bs = ShapeOf(w.type);
-  RPG_CHECK(w.cols % bs.elems == 0, "点积长度 %lld 不是块大小 %d 的整数倍",
+  RPG_CHECK(w.cols % bs.elems == 0, "dot length %lld is not a multiple of the block size %d",
             static_cast<long long>(w.cols), bs.elems);
   RPG_CHECK(w.buf.size() == static_cast<size_t>(w.rows) * w.row_bytes(),
-            "张量字节数与 [%lld,%lld] 的形状不符 —— 加载期就该发现，不该等到这里",
+            "tensor byte count does not match the [%lld,%lld] shape; this should have been caught at load time",
             static_cast<long long>(w.rows), static_cast<long long>(w.cols));
   const unsigned gy = GridFor(n_tokens, kTileTokens);
   const dim3 grid(static_cast<unsigned>(w.rows), gy);
@@ -500,7 +500,7 @@ void GpuMatMulQuant(const GpuTensor& w, const float* X_dev, int64_t n_tokens,
 
 void GpuRmsNorm(const float* x, const float* w, int64_t n_rows, int64_t n,
                 int64_t stride, float eps, float* out) {
-  RPG_CHECK(n > 0 && n_rows > 0 && stride >= n, "RmsNorm 参数不合法");
+  RPG_CHECK(n > 0 && n_rows > 0 && stride >= n, "invalid RmsNorm arguments");
   RmsNormKernel<<<static_cast<unsigned>(n_rows), kThreads>>>(x, w, n, stride, eps,
                                                              out);
   CheckLaunch("RmsNormKernel");
@@ -509,7 +509,7 @@ void GpuRmsNorm(const float* x, const float* w, int64_t n_rows, int64_t n,
 void GpuRope(float* x, int32_t n_heads, int32_t head_dim, const float* rope_tab,
              int64_t pos0, int64_t n_rows) {
   const int32_t half = head_dim / 2;
-  RPG_CHECK(head_dim % 2 == 0, "head_dim %d 必须是偶数（RoPE 半维配对）", head_dim);
+  RPG_CHECK(head_dim % 2 == 0, "head_dim %d must be even (RoPE pairs half-dimensions)", head_dim);
   const int64_t total = n_rows * n_heads * half;
   RopeKernel<<<GridFor(total, 256), 256>>>(x, n_heads, head_dim, half, rope_tab,
                                            pos0);
@@ -519,7 +519,7 @@ void GpuRope(float* x, int32_t n_heads, int32_t head_dim, const float* rope_tab,
 void GpuCausalAttention(const ModelMeta& c, const float* q_dev,
                         const float* k_dev, const float* v_dev, int64_t seq,
                         float* out_dev) {
-  RPG_CHECK(seq > 0, "attention 的 seq 必须为正");
+  RPG_CHECK(seq > 0, "attention seq must be positive");
   const float scale = 1.0f / sqrtf(static_cast<float>(c.head_dim));
   // 共享内存 = scores[seq] + 8 字节对齐的 red[kThreads]。
   const size_t fl = (static_cast<size_t>(seq) + 1u) & ~static_cast<size_t>(1u);
@@ -542,9 +542,9 @@ void GpuKvWrite(const float* k_dev, const float* v_dev, int32_t n_kv_heads,
                 int32_t head_dim, int64_t pos0, int64_t seq,
                 uint16_t* k_cache_layer, uint16_t* v_cache_layer,
                 int64_t max_seq) {
-  RPG_CHECK(seq > 0 && n_kv_heads > 0 && head_dim > 0, "KvWrite 参数不合法");
-  RPG_CHECK(pos0 >= 0, "写入位置 %lld 不能为负", static_cast<long long>(pos0));
-  RPG_CHECK(pos0 + seq <= max_seq, "写入区间 [%lld, %lld) 超出 cache 容量 %lld",
+  RPG_CHECK(seq > 0 && n_kv_heads > 0 && head_dim > 0, "invalid KvWrite arguments");
+  RPG_CHECK(pos0 >= 0, "write position %lld must not be negative", static_cast<long long>(pos0));
+  RPG_CHECK(pos0 + seq <= max_seq, "write range [%lld, %lld) exceeds the cache capacity %lld",
             static_cast<long long>(pos0), static_cast<long long>(pos0 + seq),
             static_cast<long long>(max_seq));
   const int64_t total = seq * n_kv_heads * head_dim;
@@ -559,8 +559,8 @@ void GpuAttentionFromCache(const ModelMeta& c, int64_t pos0, const float* q_dev,
                            int64_t seq, const uint16_t* k_layer,
                            const uint16_t* v_layer, int64_t max_seq,
                            float* out_dev) {
-  RPG_CHECK(seq > 0, "attention 的 seq 必须为正");
-  RPG_CHECK(pos0 >= 0, "pos0 不能为负");
+  RPG_CHECK(seq > 0, "attention seq must be positive");
+  RPG_CHECK(pos0 >= 0, "pos0 must not be negative");
   const float scale = 1.0f / sqrtf(static_cast<float>(c.head_dim));
   // scores 按**绝对位置数** n_scores = pos0 + seq 备（见 kernel 里的说明）。
   const int64_t n_scores = pos0 + seq;
@@ -584,8 +584,8 @@ void GpuAttentionFromCache(const ModelMeta& c, int64_t pos0, const float* q_dev,
 }
 
 void GpuArgMax(const float* x_dev, int64_t n, int32_t* out_idx_dev) {
-  RPG_CHECK(n > 0, "argmax 的长度必须为正");
-  RPG_CHECK(n <= 0x7FFFFFFF, "argmax 的下标超出 int32（%lld）",
+  RPG_CHECK(n > 0, "argmax length must be positive");
+  RPG_CHECK(n <= 0x7FFFFFFF, "argmax index exceeds int32 (%lld)",
             static_cast<long long>(n));
   ArgMaxKernel<<<1, kArgMaxThreads>>>(x_dev, n, out_idx_dev);
   CheckLaunch("ArgMaxKernel");
@@ -606,7 +606,7 @@ void GpuVecAddInPlace(float* a_dev, const float* b_dev, int64_t n) {
 void GpuEmbeddingLookup(const GpuTensor& emb, const int32_t* toks_dev, int64_t seq,
                         float* x_dev) {
   const BlockShape bs = ShapeOf(emb.type);
-  RPG_CHECK(emb.cols % bs.elems == 0, "embedding 宽度 %lld 不是块大小的整数倍",
+  RPG_CHECK(emb.cols % bs.elems == 0, "embedding width %lld is not a multiple of the block size",
             static_cast<long long>(emb.cols));
   const int64_t n = seq * emb.cols;
   EmbeddingLookupKernel<<<GridFor(n, 256), 256>>>(

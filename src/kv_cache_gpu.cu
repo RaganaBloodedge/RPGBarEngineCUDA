@@ -19,9 +19,9 @@ GpuKvCache::GpuKvCache(const ModelMeta& c, int64_t max_seq)
       head_dim_(c.head_dim),
       max_seq_(max_seq) {
   RPG_CHECK(n_layers_ > 0 && n_kv_heads_ > 0 && head_dim_ > 0,
-            "模型配置不完整，建不了 KV Cache（层 %d / KV 头 %d / head_dim %d）",
+            "incomplete model config, cannot build a KV cache (%d layers / %d KV heads / head_dim %d)",
             n_layers_, n_kv_heads_, head_dim_);
-  RPG_CHECK(max_seq_ > 0, "max_seq 必须为正，给了 %lld",
+  RPG_CHECK(max_seq_ > 0, "max_seq must be positive, got %lld",
             static_cast<long long>(max_seq_));
 
   const size_t per = static_cast<size_t>(n_layers_) *
@@ -36,13 +36,13 @@ GpuKvCache::GpuKvCache(const ModelMeta& c, int64_t max_seq)
 }
 
 uint16_t* GpuKvCache::k_layer(int32_t layer) {
-  RPG_CHECK(layer >= 0 && layer < n_layers_, "层号 %d 越界（共 %d 层）", layer,
+  RPG_CHECK(layer >= 0 && layer < n_layers_, "layer index %d out of range (%d layers)", layer,
             n_layers_);
   return static_cast<uint16_t*>(k_.data()) + static_cast<int64_t>(layer) * LayerElems();
 }
 
 uint16_t* GpuKvCache::v_layer(int32_t layer) {
-  RPG_CHECK(layer >= 0 && layer < n_layers_, "层号 %d 越界（共 %d 层）", layer,
+  RPG_CHECK(layer >= 0 && layer < n_layers_, "layer index %d out of range (%d layers)", layer,
             n_layers_);
   return static_cast<uint16_t*>(v_.data()) + static_cast<int64_t>(layer) * LayerElems();
 }
@@ -52,7 +52,7 @@ const uint16_t* GpuKvCache::k_layer(int32_t layer) const {
 }
 
 void GpuKvCache::SetLen(int64_t n) {
-  RPG_CHECK(n >= 0 && n <= max_seq_, "长度 %lld 越界（容量 %lld）",
+  RPG_CHECK(n >= 0 && n <= max_seq_, "length %lld out of range (capacity %lld)",
             static_cast<long long>(n), static_cast<long long>(max_seq_));
   len_ = n;
 }
@@ -61,7 +61,7 @@ std::string GpuKvCache::Describe() const {
   char buf[192];
   const double mib = static_cast<double>(bytes()) / 1048576.0;
   std::snprintf(buf, sizeof(buf),
-                "KV Cache(fp16) %d 层 × %d KV 头 × %lld × %d = %.1f MiB（当前 %lld）",
+                "KV Cache(fp16) %d layers x %d KV heads x %lld x %d = %.1f MiB (currently %lld)",
                 n_layers_, n_kv_heads_, static_cast<long long>(max_seq_),
                 head_dim_, mib, static_cast<long long>(len_));
   return std::string(buf);

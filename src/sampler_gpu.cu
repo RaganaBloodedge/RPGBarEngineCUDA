@@ -30,7 +30,7 @@ constexpr int kSampleThreads = 1024;
 
 void CheckLaunch(const char* what) {
   const cudaError_t e = cudaGetLastError();
-  RPG_CHECK(e == cudaSuccess, "%s 启动/执行失败：%s", what, cudaGetErrorString(e));
+  RPG_CHECK(e == cudaSuccess, "%s failed to launch/execute: %s", what, cudaGetErrorString(e));
 }
 
 // ---------------------------------------------------------------- 有序 key
@@ -325,10 +325,10 @@ float DevCounterUniform(uint64_t seed, uint64_t counter) {
 
 void GpuFilterToProbs(const float* logits_dev, int64_t n, const SampleOptions& opt,
                       float* probs_dev) {
-  RPG_CHECK(logits_dev != nullptr && probs_dev != nullptr, "采样的缓冲不能为空");
-  RPG_CHECK(n > 0, "采样的词表长度必须为正（给了 %lld）",
+  RPG_CHECK(logits_dev != nullptr && probs_dev != nullptr, "the sampling buffer must not be null");
+  RPG_CHECK(n > 0, "the sampling vocab size must be positive (got %lld)",
             static_cast<long long>(n));
-  RPG_CHECK(n <= 0x7FFFFFFF, "词表长度超出 int32 下标（%lld）",
+  RPG_CHECK(n <= 0x7FFFFFFF, "vocab size exceeds int32 indexing (%lld)",
             static_cast<long long>(n));
   FilterProbsKernel<<<1, kSampleThreads>>>(logits_dev, n, opt.temperature,
                                            opt.top_k, opt.top_p, probs_dev);
@@ -337,11 +337,11 @@ void GpuFilterToProbs(const float* logits_dev, int64_t n, const SampleOptions& o
 
 void GpuInverseSample(const float* probs_dev, int64_t n, float u,
                       int32_t* out_idx_dev) {
-  RPG_CHECK(probs_dev != nullptr && out_idx_dev != nullptr, "采样的缓冲不能为空");
-  RPG_CHECK(n > 0, "采样的词表长度必须为正（给了 %lld）",
+  RPG_CHECK(probs_dev != nullptr && out_idx_dev != nullptr, "the sampling buffer must not be null");
+  RPG_CHECK(n > 0, "the sampling vocab size must be positive (got %lld)",
             static_cast<long long>(n));
   // ⚠️ u 必须是 [0,1)：约 1 时那个 `cum > u` 可能永远不成立（走兜底分支）。
-  RPG_CHECK(u >= 0.0f && u < 1.0f, "u 必须落在 [0,1)，给了 %g",
+  RPG_CHECK(u >= 0.0f && u < 1.0f, "u must be in [0,1), got %g",
             static_cast<double>(u));
   InverseSampleKernel<<<1, 1>>>(probs_dev, n, static_cast<double>(u), out_idx_dev);
   CheckLaunch("InverseSampleKernel");
@@ -353,7 +353,7 @@ void GpuSampleToken(const float* logits_dev, int64_t n, const SampleOptions& opt
   // 贪心不消耗随机数 —— 与 CPU 版 SampleToken 的**第一条分支**同序。
   // 这条分支让"不传 temperature 的老路径"与 M2 的纯贪心逐位一致。
   if (!(opt.temperature > 0.0f)) {
-    RPG_CHECK(logits_dev != nullptr && out_idx_dev != nullptr, "采样的缓冲不能为空");
+    RPG_CHECK(logits_dev != nullptr && out_idx_dev != nullptr, "the sampling buffer must not be null");
     GpuArgMax(logits_dev, n, out_idx_dev);
     return;
   }

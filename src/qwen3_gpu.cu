@@ -25,7 +25,7 @@ const float* CF(const DeviceBuffer& b) {
 
 // 只增不减（理由见 GpuScratch 的注释）。
 void Need(DeviceBuffer& b, int64_t n_floats) {
-  RPG_CHECK(n_floats > 0, "缓冲尺寸必须为正");
+  RPG_CHECK(n_floats > 0, "buffer size must be positive");
   const size_t bytes = static_cast<size_t>(n_floats) * sizeof(float);
   if (b.size() < bytes) b.Alloc(bytes);
 }
@@ -147,17 +147,17 @@ void GpuForwardFull(const GpuModel& m, const int32_t* tokens, int64_t seq,
   const ModelMeta& c = m.config();
   const int64_t hidden = c.hidden;
 
-  RPG_CHECK(seq > 0, "prompt 为空");
+  RPG_CHECK(seq > 0, "prompt is empty");
 
   // 这一段在 cache 里的起始位置（不传 cache 就是 0）。与 CPU 版逐字对应。
   const int64_t pos0 = (kv != nullptr) ? kv->len() : 0;
   RPG_CHECK(pos0 + seq <= m.rope_positions(),
-            "位置 %lld 超出 RoPE 表覆盖的 %lld（构造 GpuModel 时传更大的 max_pos，"
-            "或先 session_reset）",
+            "position %lld is beyond the %lld positions the RoPE table covers (pass a larger max_pos when constructing GpuModel, "
+            "or call session_reset first)",
             static_cast<long long>(pos0 + seq),
             static_cast<long long>(m.rope_positions()));
   if (kv != nullptr) {
-    RPG_CHECK(pos0 + seq <= kv->max_seq(), "位置 %lld 超出 KV Cache 容量 %lld",
+    RPG_CHECK(pos0 + seq <= kv->max_seq(), "position %lld exceeds the KV cache capacity %lld",
               static_cast<long long>(pos0 + seq),
               static_cast<long long>(kv->max_seq()));
   }
@@ -166,7 +166,7 @@ void GpuForwardFull(const GpuModel& m, const int32_t* tokens, int64_t seq,
   // 只会读到别人张量的字节 —— 然后"能出词但胡说"。
   for (int64_t t = 0; t < seq; ++t) {
     RPG_CHECK(tokens[t] >= 0 && tokens[t] < c.vocab,
-              "第 %lld 个 token id = %d 越界（词表 %d）", static_cast<long long>(t),
+              "token #%lld has id = %d, out of range (vocab %d)", static_cast<long long>(t),
               tokens[t], c.vocab);
   }
 
@@ -233,9 +233,9 @@ void GpuForwardFull(const GpuModel& m, const int32_t* tokens, int64_t seq,
 
 void GpuForwardStep(const GpuModel& m, int32_t token, int64_t pos, GpuKvCache* kv,
                     GpuScratch* s, std::vector<float>* logits) {
-  RPG_CHECK(kv != nullptr, "GpuForwardStep 需要 KV Cache");
+  RPG_CHECK(kv != nullptr, "GpuForwardStep requires a KV cache");
   RPG_CHECK(pos == kv->len(),
-            "增量解码只支持顺序追加：pos = %lld，而 cache 长度 = %lld",
+            "incremental decoding only appends in order: pos = %lld but the cache length is %lld",
             static_cast<long long>(pos), static_cast<long long>(kv->len()));
   // 与 CPU 版一样只有这一行 —— 增量解码不是"另一份实现"，就是整段前向在
   // seq = 1、pos0 = cache.len() 上的特例。
@@ -248,18 +248,18 @@ void GpuGenerate(const GpuModel& m, GpuKvCache* kv, GpuScratch* s,
                  const float* first_logits_dev, const GpuGenerateOptions& opt,
                  std::vector<int32_t>* out_ids) {
   const ModelMeta& c = m.config();
-  RPG_CHECK(kv != nullptr, "GpuGenerate 需要 KV Cache");
-  RPG_CHECK(first_logits_dev != nullptr, "first_logits 为空（prefill 之后才有）");
-  RPG_CHECK(opt.max_tokens > 0, "max_tokens 必须为正，给了 %d", opt.max_tokens);
+  RPG_CHECK(kv != nullptr, "GpuGenerate requires a KV cache");
+  RPG_CHECK(first_logits_dev != nullptr, "first_logits is null (only available after a prefill)");
+  RPG_CHECK(opt.max_tokens > 0, "max_tokens must be positive, got %d", opt.max_tokens);
   RPG_CHECK(!s->argmax_idx.empty(),
-            "GpuScratch 还没 Ensure 过（先跑一次 prefill）");
+            "GpuScratch has not been Ensure()d yet (run a prefill first)");
   // 贪心不消耗随机数、也不需要概率缓冲（GpuSampleToken 的那条分支只调
   // GpuArgMax）。于是"老路径"连 probs 都不必存在 —— 这一点是刻意的：
   // 让贪心路径对 scratch 的要求与 P2 完全一致，就少一个可能红的地方。
   const bool greedy = !(opt.sample.temperature > 0.0f);
   if (!greedy) {
     RPG_CHECK(s->probs.size() >= static_cast<size_t>(c.vocab) * sizeof(float),
-              "采样的概率缓冲没备好（[%d] 个 float）—— 先跑一次 prefill",
+              "the sampling probability buffer is not ready ([%d] floats); run a prefill first",
               c.vocab);
   }
   float* probs = static_cast<float*>(s->probs.data());
@@ -308,8 +308,8 @@ void GpuGenerate(const GpuModel& m, GpuKvCache* kv, GpuScratch* s,
     // 上下文满了就明确报错，不静默截断 —— 静默停下会让人以为"模型自己
     // 讲完了"，而实际是宿主把 max_seq 配小了。
     RPG_CHECK(kv->len() < kv->max_seq(),
-              "上下文已满（%lld 个位置，已生成 %d 个 token）—— 需要更大的 "
-              "max_seq，或先 session_reset",
+              "context is full (%lld positions, %d tokens generated); a larger "
+              "max_seq is needed, or call session_reset first",
               static_cast<long long>(kv->max_seq()), i + 1);
 
     // **每个**返回的 token 都写进 cache —— 包括最后那个与停止 token。
