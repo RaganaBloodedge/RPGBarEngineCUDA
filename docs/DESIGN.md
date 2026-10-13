@@ -90,6 +90,20 @@ char*       rpg_engine_model_info(int32_t model);
 > —— 它就是在告诉你这个文件从哪来、以及"别在这里改"。要确认没有跑偏，跑
 > `python tests/check_sync.py`。
 
+> ⚠️ **"逐字节一致"现在包含"带不带 UTF-8 BOM"**（P3 第四步加的一条）。
+>
+> Windows 侧的 `nvcc` 按**本地代码页**（936）读源文件，且**只认 BOM** —— 不带 BOM 时
+> 中文字符串字面量会被按 GBK 解读，某些字节序列产生假的反斜杠 `\`，把结束引号转义掉
+> ⇒ `missing closing quote`。理由与排除过程见 §8 的 P3 第四步。
+>
+> 于是这条约束**穿过 §3 的边界反向传染到了上游**：上表里"复用"那一栏的文件**两边都得带
+> BOM**，否则 `check_sync.py` 会整批报"第 1 行不同"（这一次是 16 项）。**两边一起改才自洽**，
+> 这也是为什么 CPU 仓库会跟着出现 16 个纯 BOM 的 diff。
+>
+> 判断标准是**逐文件的**：`.cu` 加了、它 include 的 `.h` 没加一样炸。所以
+> `check_sync.py` 现在自己带一条 BOM 自检（扫 `include/` / `src/` / `tools/` 下所有
+> `.cu` / `.cuh` / `.h`），而不是把"新加头文件时记得加 BOM"留给人的记忆。
+
 ## 4. 关键设计决策
 
 ### 4.1 量化权重直传显存，不预先解量化
@@ -134,7 +148,7 @@ decode 阶段每层要发十几个小 kernel（norm / QKV / rope / attention / O
 | **P0** 工具链与骨架 | CMake + CUDA，ABI 层最小实现（version / last_error / load_model / model_info） | 见下面「P0 的判据」 |
 | **P1** 权重上卡 + 前向对拍 | 权重与反量化结果上显存；**整网（无 KV Cache）前向**跑通 | 见下面「P1 的判据」 |
 | **P2** 增量解码对拍 | KV Cache 落地（fp16）、增量解码、贪心采样 | 见下面「P2 的判据」 |
-| **P3** 接入与端到端 | 采样（**已完成**）、**ABI 接入**（**已完成：`Session` 持显存状态 + 九步 `generate`，逐条对齐 CPU 版**）、工具调用、`rpg_engine.dll` 换进 RPGBar | 采样三条判据见下面「P3 的判据」；**ABI 已在 Linux 产物上端到端跑通**（`abi_smoke` **38/0**，多轮对话出文本）；还差 Windows `.dll`（要 MSVC）与 RPGBar 侧联调 |
+| **P3** 接入与端到端 | 采样、**ABI 接入**（`Session` 持显存状态 + 九步 `generate`，逐条对齐 CPU 版）、工具调用、`rpg_engine.dll` 换进 RPGBar | ✅ **全部完成**：采样三条判据见下面「P3 的判据」；**ABI 在 Linux 与 Windows 两侧都端到端跑通**（`abi_smoke` **38/0**，多轮对话出文本）；Windows `.dll` 已编出并换进 RPGBar 的 `models/rpg_engine_cuda.dll`，游戏内一轮真实回合跑通（见 §8 P3 第四步） |
 | **P4** 性能 | 融合 kernel、量化直算调优、CUDA Graph | 1.7B Q4 上 prefill ≥ 1000 tok/s、decode ≥ 60 tok/s |
 
 > **P1 的判据比"单层"更严，这是有意的**（2026-10-12 实施时定的）：原计划写的是"跑通一层、
@@ -373,6 +387,11 @@ E **31/31 逐位相同**。回归：`run_p2.sh` 的逐 token 对拍仍 **32/32**
 > `length`。所以冒烟测试那条断言写的是"**`finish_reason` 是三种之一**"，而不是
 > "必须有非空 `text`" —— **判据得能区分"这是设计"和"这是坏了"**。
 
+⚠️ **③ 这一条在 Windows 产物上又跑了一遍**（P3 第四步）：`abi_smoke.py` 打在
+`build-win/rpg_engine.dll` 上同样 **38/0**。这不是重复劳动 —— 它是"一个 ABI、两个实现"
+里那个**更难的方向**：换实现不用改宿主、**换平台也不用改宿主**。两条工具链的差异
+（cudart 静态链入、`.dll` 依赖集）全部落在库内部，`include/rpg_engine.h` 一个字节没动。
+
 ### 性能目标（RTX 5060 Laptop，8 GB，sm_120）
 
 | 指标 | CPU 版实测 | GPU 目标 |
@@ -485,10 +504,13 @@ E **31/31 逐位相同**。回归：`run_p2.sh` 的逐 token 对拍仍 **32/32**
    prompt 后冷跑一遍"就该整体错一位相同（实测 31/31 逐位）。
    ⚠️ 这一层的判据**要么严格、要么如实标成概率性**（同 seed 两遍必须严格逐位；
    换 seed 会变、剪枝会改选，这两条就是概率性），不要混成"差不多就行"。
-6. 🔶 **宿主层端到端**（P3）：**Linux 侧已经通了** —— `abi_smoke.py` 38/0 加一次
-   `ctypes` 直调的多轮对话（见 §5 ③）。**还差 Windows**：产物要换成 `rpg_engine.dll`，
-   再跑 RPGBar 的 `smoke_test.py` 全量 + `ui_check.js`。卡点是**编译器**（见 §8 末），
-   不是接口 —— `include/rpg_engine.h` 一个字节没改。
+6. ✅ **宿主层端到端**（P3 完成，Linux 与 Windows 两侧都跑过）：Linux 侧是
+   `abi_smoke.py` 38/0 加一次 `ctypes` 直调的多轮对话（见 §5 ③）；Windows 侧是同一份
+   `abi_smoke.py` 打在 `build-win/rpg_engine.dll` 上（38/0），再把它换进 RPGBar 的
+   `models/rpg_engine_cuda.dll`，跑 `smoke_test.py` 258/0 + `ui_check.js` 115/0，
+   最后在游戏里真发一轮 action（32.7 s 出字，含 DM 的工具循环）。
+   ⚠️ **两侧的数字不是"对拍"**：它们是同一条代码路径在两种工具链下的各自实测，
+   该逐位对拍的是 §7 那几条。**"换库不用改宿主"这句话，是靠"两侧都真的跑过"来证的。**
 
 > **判据的参考侧一律是"真的在跑的那一份"**：反量化用从 RPGBarEngine 逐字复制的
 > `quant.cc`，整网用**现场编译出来的** CPU 引擎 `forward_check`（`tools/build_cpu_ref.sh`）。
@@ -500,33 +522,42 @@ E **31/31 逐位相同**。回归：`run_p2.sh` 的逐 token 对拍仍 **32/32**
 | --- | --- |
 | GPU | 支持 CUDA 的 NVIDIA 卡；本项目开发机 = **RTX 5060 Laptop 8 GB（Blackwell，sm_120）** |
 | 驱动 | ≥ 提供 CUDA 12.8 运行时的版本（sm_120 的硬性下限）；开发机 = 595.97 / CUDA 13.2 |
-| 工具链 | **CUDA Toolkit 13.2**（`nvcc` V13.2.86）—— ✅ 已装在 **WSL（Ubuntu 24.04）** 里（`apt install cuda-toolkit-13-2`，走 NVIDIA 官方 apt 源：Ubuntu 自带的 `nvidia-cuda-toolkit` 只有 12.0、**不支持 sm_120**） |
-| 编译器 | host 部分：MSVC 2022 或 g++ 13+；⚠️ **Windows 上 nvcc 只认 `cl.exe`**，而开发机没有 VS/MSVC |
+| 工具链 | **CUDA Toolkit 13.2**（`nvcc` V13.2.86）—— ✅ 已装在 **WSL（Ubuntu 24.04）** 里（`apt install cuda-toolkit-13-2`，走 NVIDIA 官方 apt 源：Ubuntu 自带的 `nvidia-cuda-toolkit` 只有 12.0、**不支持 sm_120**）；✅ **Windows 侧也已装**（宿主产物需要它） |
+| 编译器 | host 部分：**MSVC**（`cl.exe`，VS Build Tools 即可，不必装 IDE）或 g++ 13+；⚠️ **Windows 上 nvcc 只认 `cl.exe`**，不接受 g++ / MinGW；Linux 侧是 g++ |
+| `reg.exe` | ⚠️ **Windows 构建时 nvcc 每次真正编译都要调它**（去找 MSVC 与 Windows SDK 的位置）—— 被安全软件拦掉时会表现成"莫名编不过"，而 `nvcc --version` 看不出来（它不调） |
+| 源码编码 | ⚠️ **`.cu` / `.cuh` / `.h` 必须带 UTF-8 BOM**（Windows 侧 nvcc 的硬前提，见下） |
 | 判据脚本 | `tests/run_p1.sh` 需要 **numpy**（`apt install python3-numpy`，实测 1.26.4）；`check_sync.py` / `abi_smoke.py` 只要标准库 |
 | 显存 | ≥ 4 GB。P1 实测（21 token）：权重 **1.03 GiB** + 前向暂存 14.8 MB，上卡后设备剩余 5.62 GiB；P2 再加 fp16 KV（**28 MiB @256 位置 / 448 MiB @4096**，见 §4.2） |
 
-### 为什么构建放在 WSL 里做（开发机的真实约束）
+### 两条构建路径（以及为什么两条都要留）
 
-| | nvcc | cmake | g++ | MSVC | GPU 直通 |
-| --- | --- | --- | --- | --- | --- |
-| Windows 侧 | ✗ | ✗ | ✓（MSYS2） | **✗（整台机器没有 VS）** | — |
-| WSL Ubuntu 24.04 | ✓ 13.2 | ✓ | ✓ | — | ✓ `/dev/dxg` + `nvidia-smi` 认卡 |
+| | nvcc | cmake | g++ | MSVC | 产物 | GPU 直通 |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Windows**（`build_win.ps1`） | ✓ 13.2 | ✓ | （不需要） | ✓ VS Build Tools | **`rpg_engine.dll`** ← 宿主真正加载的那一份 | ✓ |
+| WSL Ubuntu 24.04（`build_wsl.sh`） | ✓ 13.2 | ✓ | ✓ | — | `librpg_engine.so` | ✓ `/dev/dxg` + `nvidia-smi` 认卡 |
 
-⇒ 在 Windows 上编 CUDA **必须同时装 MSVC**（nvcc 不接受 g++ 当宿主编译器），
-而 WSL 只差一个 nvcc、`apt` 就能装。所以定成这样：**P0–P3 的算法验证与 ABI 接入都走 WSL**
-（产物 `librpg_engine.so`），**只差"变成宿主能加载的 `.dll`"这一步时才要补 MSVC +
-Windows 版 Toolkit**。
+**哪条管什么**：Windows 产物是宿主（Python `ctypes` / Unity `P/Invoke`）**实际加载**的那一份，
+也是最终分发的那一份；WSL 那条约等于"工具链顺手 + 只在 Ubuntu 上有的东西（`run_p*.sh` 那套
+一键判据）"，算法层的日常验证都在那边跑。
 
-⚠️ 这条是 **P3 结束时唯一没完成的事**，而它卡住的是**编译器而不是接口**：
-`abi_smoke` 38/0 与那次多轮对话都是在 Linux 产物上跑出来的，`include/rpg_engine.h`
-一个字节没动（`check_sync` 里那两个 ABI 文件仍逐字一致）。换个平台能编出 `.dll`，
-宿主一行不用改 —— 这正是"一个 ABI、两个实现"当初要买的东西。
+⚠️ **两者不能只留一条**：Windows 的 `.dll` 才是分发给玩家的东西，但 `build_wsl.sh` 那条链上
+挂着 P1–P3 的全部一键判据脚本（`run_p1.sh` / `run_p2.sh` / `run_p3.sh`），跨平台脚本比
+`.ps1` 好维护。**有一条"两边都必须编得过"的隐含判据在这里**：只编一条路径，
+另一条会静默烂掉（MSVC 分支那次漏限定就是这么来的，见 §8 的 P3 第四步）。
 
 ⚠️ WSL 通过 9p 访问 `E:\` 的顺序写只有 **173 MB/s**（原生 ext4 是 2.5 GB/s，差 14 倍）。
 所以：源码只留一份（`/mnt/e`，git 管着，Windows 与 WSL 看到的是同一份，不会分叉），
 **构建目录一律落 WSL 原生**（默认 `~/cuda-build`）。这就是 `build_wsl.sh` 存在的理由。
+Windows 侧没有这个约束（构建目录默认 `build-win/`，已在 `.gitignore` 里）。
 
 ### 编译
+
+```powershell
+# Windows（需要 CUDA Toolkit + VS Build Tools；产物是宿主加载的那一份）
+./build_win.ps1                 # 产物 build-win/rpg_engine.dll（默认四架构）
+./build_win.ps1 -Clean
+./build-win/cuda_check.exe      # 工具链自检（不需要权重）
+```
 
 ```bash
 # 在 WSL 里（脚本找不到 nvcc 会拒绝继续，并提示 host-only 路径）
@@ -539,9 +570,20 @@ cmake -S . -B ~/cuda-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES
 cmake --build ~/cuda-build -j
 ```
 
-`-DCMAKE_CUDA_ARCHITECTURES=native` 会按本机 GPU 定架构；跨机器分发时要显式列
-（如 `-DCMAKE_CUDA_ARCHITECTURES=86;89;120`）—— ⚠️ 但**别用 `native` 编出来的产物发给
-别人**，在别的卡上会"加载即失败"。
+**默认架构是 `75;86;89;120`**（Turing / Ampere / Ada / Blackwell）—— 与 `CMakeLists.txt` 里的
+默认值一致。⚠️ 手工编时**别用 `-DCMAKE_CUDA_ARCHITECTURES=native` 然后发给别人**：
+`native` 只出本机 SASS，换台机器是"选项亮着、一生成就失败"（`no kernel image is available`）。
+确认方法：`cuobjdump --list-elf build-win/rpg_engine.dll` 要能列出四份 SASS。
+
+⚠️ **`build_win.ps1` 里的两条刻意的反常规写法**（都是为了绕开 PowerShell 5.1 的老毛病）：
+
+- **不调 vcvars**，直接从文件系统推导 `PATH` / `INCLUDE` / `LIB`。调 vcvars 会去查注册表，
+  而"从文件系统推导 + 显式传 `-DCMAKE_CUDA_COMPILER_TOOLKIT_ROOT`"这条路更可控，
+  也让 `find_package(CUDAToolkit)` 不必自己去查。
+- **`$ErrorActionPreference` 不设成 `Stop`**：PowerShell 会把 native 工具写进 stderr 的东西
+  当成致命错误，而 `cl.exe` 无参数时就会写 stderr ⇒ 假失败。
+- 脚本**纯 ASCII**：PowerShell 5.1 读**无 BOM** 的 `.ps1` 时按 ANSI 处理，中文注释会
+  吃掉行首字符导致解析崩（`.bat` 同理，按 OEM 代码页读）。
 
 ### 首次编译的实测结果（2026-10-12，P0 两档判据全绿）
 
@@ -782,6 +824,152 @@ abi_smoke.py（CUDA 产物 + 真实权重，WSL）        38 通过 / 0 失败�
 > （`unterminated_think`、生成数达上限）都正确指向 `length`。所以冒烟测试的断言写的是
 > "`finish_reason` 是三种之一"，而不是"`text` 必须非空"——**判据得能区分"设计"与"坏了"。**
 
+### P3 第四步：Windows 产物（2026-10-13，唯一一次"坑不在代码里"）
+
+**先记结论**：源码**一个字都没改**就能编过 —— 卡住的全部是工具链与编码。
+根因是 `nvcc` 每次真正编译都要调 `reg.exe`（去找 MSVC 与 Windows SDK 的位置），
+而它被安全软件拦着。⚠️ **`nvcc --version` 不调它**，所以之前一直看不出来"是环境问题"。
+
+**三个坑，按踩到的顺序**：
+
+**坑 1 —— 裸的 MSVC 风格开关会被 nvcc 当成输入文件。**
+`CMakeLists.txt` 的 MSVC 分支写着 `add_compile_options(/O2 /utf-8 /fp:precise)`，
+在 Windows 上编译时 13 个 `.cu` **全挂**：
+
+```text
+nvcc fatal : A single input file is required for a non-link phase when an outputfile is specified
+```
+
+原因：Windows 上 `/` 也是路径分隔符，`/O2` 被当成"第二个输入文件"。
+`else()` 分支（GCC/Clang）早就用语言限定生成式挡过同一类问题
+（`$<$<COMPILE_LANGUAGE:CXX>:-O2>`，注释里明写"别让它也落到 CUDA 上"），
+**MSVC 分支因为从没在 Windows 上跑过而漏了** —— 这就是 §8 开头那条教训的第二次兑现：
+"另一条 `#ifdef` 路径编得过"推不出"这条编得过"。
+
+> 🔧 **排查手段值得单独记**：写一个一行内容的 `tiny2.cu`，**逐级加参数做二分**
+> （t1–t15：空编 → 加 `-O2` → 换成 `-Xcompiler=/O2` → 加 `-utf-8` ……），
+> 十几分钟就把"哪个开关有问题"钉死了。对着 13 个文件的几十条报错猜，
+> 只会得到"可能是 include 顺序"这类错结论（我确实先怀疑了 include 顺序）。
+
+**坑 2 —— `.cu` / `.cuh` / `.h` 必须带 UTF-8 BOM（这条最贵）。**
+`nvcc` 在 Windows 上按**本地代码页**（936）读源文件；不含 BOM 的中文按 GBK 解读时，
+某些字节序列会产生**假的反斜杠 `\`**，把字符串的结束引号转义掉：
+
+```text
+error: missing closing quote      （实测 62 次）
+error: unrecognized token
+```
+
+而且错误**连锁**到后面几十行（一个字符串被吃掉，后面的语法全乱）。
+
+**试过并证伪的方案（都别再试了）**：
+
+| 方案 | 为什么没用 |
+| --- | --- |
+| `nvcc -utf-8` | 只管 execution charset（运行时字符串编码），**管不到 nvcc 自己的词法器** |
+| `-Xcompiler=/utf-8` | 只影响交给 `cl` 的那半 —— ⚠️ 而且它**会让一部分中文字符串编不过**（详见坑 4 的排除表：它确实能把字面量变成 UTF-8，但在同一个代码库里是**不稳定**的） |
+| `chcp 65001` | 无效 |
+| 换 clang 当 host | 本机只有 **ARM64** 版 `clang-cl.exe`，用不了 |
+| 改代码把中文字符串换掉 | 能绕，但会污染源码（而且那才是"改代码"） |
+
+⇒ **只有 BOM，而且逐文件判定**。给 `.cu` 加完 BOM 之后又暴露下一层：
+`cl` 读**无 BOM** 的 `.h` 时行尾会产生 `\`，把结构吃掉 ⇒
+`fatal error C1020: 意外的 #endif`（`cuda_common.h(84)` / `cli_util.h(87)`）。
+⚠️ 因为 `#include "common.h"` 是**相对引用**（同目录优先），"影子目录 + `-I`"绕不过去。
+
+> ⚠️ 只有**中文字符串字面量**会炸；纯中文**注释**无害（预处理阶段就被剥离）。
+> 这一点决定了修法：不是"删掉中文"，是"给文件补 BOM"。
+
+> 🔴 **BOM 的代价落到了上游**：带 BOM 的文件里有一半是"逐字节复制"的同源副本（§3），
+> 上游同名文件不加 BOM，`check_sync.py` 就整批报"第 1 行不同"（16 项）。
+> 于是 CPU 仓库（RPGBarEngine）也跟着有了 16 个纯 BOM 的改动 —— **两边一起改才自洽**。
+> 顺着这条，`check_sync.py` 加了 BOM 自检：见 §3 末尾。
+
+**坑 3 —— cudart 是静态链进去的，`nvcuda.dll` 是延迟加载的。**
+`dumpbin /dependents build-win/rpg_engine.dll` 只有：
+
+```text
+KERNEL32.dll / MSVCP140.dll / VCRUNTIME140.dll / VCRUNTIME140_1.dll / api-ms-win-crt-*.dll
+```
+
+**没有 `cudart64_13.dll`**（运行期静态链入）⇒ 分发时**不用带**它；
+**也没有 `nvcuda.dll`**（延迟加载）⇒ 没装 N 卡的机器上 `LoadLibrary` **不会失败**。
+这两件事一起说明：**"库能不能加载"与"有没有可用 GPU"是两件事**，宿主侧的探测必须
+分开判（RPGBar 的 `server/engine.py` 因此改成三道门：产物在不在 → 能不能加载
+（缺 VC 运行库在这里暴露）→ 驱动 `cuInit` + `cuDeviceGetCount` + 算力地板）。
+
+**坑 4 —— `.cu` 里的中文字符串进二进制是 GBK（未修，见 §9 第 7 条）。**
+BOM 解决了"**读**得对不对"（坑 2），但没解决"**写出去**是什么编码"：nvcc 的宿主侧字面量
+按**执行字符集**落盘，而执行字符集默认 = 系统代码页（936）。
+
+**怎么发现的**：GPU 后端的启动日志里，一部分中文正常、一部分是乱码，而且是**同一个 dll
+打出来的**。查日志文件的字节才发现前半段是合法 UTF-8、后半段是合法 GBK（解码后是通的，
+说明不是"坏字节"而是"换了编码"）。
+
+**怎么定位到具体文件**：在 `rpg_engine_cuda.dll` 里按字节搜同一个词 ——
+
+| 词 | 在 dll 里 | 出处 |
+| --- | --- | --- |
+| `权重已上卡` | **UTF-8 有、GBK 也有** | `engine.cc:287`（.cc）+ `gpu_model.cu:237`（.cu）同一条消息 |
+| `已创建会话` | 只有 UTF-8 | 只在 `engine.cc` |
+| `分词器就绪` | 只有 UTF-8 | 只在 `tokenizer.cc` |
+
+⇒ 判据是**干净的**：同一句话在 `.cu` 与 `.cc` 各有一份时，就能直接看出两边的编码不同。
+（这比"看终端乱不乱"可靠得多 —— 终端的行为取决于代码页，会骗人。）
+
+**排除过的编译器开关（都别再试）**：
+
+| 试过 | 结果 |
+| --- | --- |
+| `-Xcompiler=/source-charset:.936 -Xcompiler=/execution-charset:utf-8` | **完全无效**：字面量在 `.obj` 里仍是 GBK（用"在 .obj 里按字节找两种编码"验的） |
+| `-Xcompiler=/utf-8` | **能把字面量变成 UTF-8**（这正是想要的），但**一部分中文字符串直接编不过**：同一次实验里 `"测试"` 通过、`"权重已上卡"` 报 `missing closing quote` ⇒ **不可用**（这也解释了上一轮"`-Xcompiler=/utf-8` 会破坏编译"的观察） |
+| `-Xcompiler=/execution-charset:utf-8`（单给） | 无效（与第一条同一个结论） |
+
+⚠️ **复盘一句**：上一轮我把 `-Xcompiler=/utf-8` 记成"会破坏带 BOM 的文件"，其实是
+"**会让一部分中文字符串编不过**"。两条描述的差别不是措辞 —— 后者才是能指导下一步判断的
+形式（它说明这条路是**不稳定**，不是**必然失败**；而"不稳定"对一个会长大的代码库来说
+更危险）。**记坑要记到能预测"下一次会不会踩"**，不是记一个"别用"。
+
+🔴 **而我这次的第一个最小样例也给出了错结论**：我用 `printf("权重已上卡：%s\n")` 复现出
+`missing closing quote`，一度判断"BOM 根本没用"。实际是**我生成的样例里那个 `\n` 是
+一个真换行**（字符串里嵌了裸换行），跟编码无关。⇒ **`missing closing quote` 有两个完全
+不同的成因**（缺 BOM 的 GBK 误读 / 字符串里真有裸换行），先看样例本身再怀疑工具链。
+后来把样例窄化成 6 个（a1–a6：带不带 `\n`、带不带 `：`、纯中文尾巴）才把变量分开。
+
+**实测（RTX 5060 Laptop + MSVC + CUDA 13.2）**：
+
+| 项 | 结果 |
+| --- | --- |
+| `build_win.ps1` | exit=0；`rpg_engine.dll` **1,061,376 B**（单 sm_120 时是 558,080 B） |
+| `cuobjdump --list-elf` | `sm_75` / `sm_86` / `sm_89` / `sm_120` **四份 SASS 齐全** |
+| `abi_smoke.py`（Windows 产物 + 真实权重） | **38 通过 / 0 失败**（`backend=cuda`） |
+| `cuda_check.exe` | RTX 5060 Laptop / 算力 12.0 / 26 SM / 显存 6.9+8.0 GiB；搬运全对 |
+| `kv_map_check.exe` | PASS |
+| `check_sync.py` | 25 一致 / 0 分叉 / 0 缺失；**37/37 带 BOM** |
+
+⚠️ 前三条里有一条**只在 Windows 上才成立**：产物把 cudart 静态链进去了，所以宿主
+换库时**不用**动任何依赖。这与"一个 ABI、两个实现"是同一件事的两面 ——
+换实现连依赖都不动。
+
+**接入 RPGBar 之后的端到端实测（同一串动作，三轮）**：
+
+| 轮次（动作） | CPU | GPU | 倍率 |
+| --- | --- | --- | --- |
+| 1（打量四周） | 199.3 s | **37.5 s** | **5.3×** |
+| 2（用力砸门） | 114.4 s | **27.7 s** | **4.1×** |
+| 3（询问卡特） | 109.2 s | **21.5 s** | **5.1×** |
+
+三轮都**零降级**（没有 `agent_note`）。这里量的口径是**玩家感受得到的一整轮**
+（DM 的工具循环 + 提到 NPC 时那次预备模型调用都在里面），不是"一次 `generate`" ——
+两者差一个数量级，混着比会得出"GPU 没什么用"的错误印象（见 §5 的 P3 实测那几行）。
+
+> ⚠️ **这一轮暴露出一件与 GPU 无关、但必须说清的事**：文档里"`think=false` 时每轮
+> 约 4–6 秒"的说法，与这次实测的 CPU 数字（109–199 s/轮）**差了一个数量级**。
+> 两个数不可能都对。合理的解释是那个 4–6 秒测的是**一次引擎调用**（且 prompt 很短），
+> 而不是"一整轮"；随着剧本 + 工具 Schema + 剧情档案把 prompt 撑到 2400+ token，
+> 一轮里的模型调用次数也不止一次。**这条留给用户定夺，没有擅自改**（它牵动
+> `think` 默认值那段说明）。
+
 ## 9. 已知风险
 
 1. **sm_120 是新架构**。CUDA 12.8 之前根本没有它的 target；工具链版本选错会得到
@@ -792,14 +980,38 @@ abi_smoke.py（CUDA 产物 + 真实权重，WSL）        38 通过 / 0 失败�
    跑了多久、温度多少。
 4. **`quant.cc` 是 host 侧复用的**，GPU 侧反量化必须**另写**并独立对拍（§7.1），
    不能"看着公式一样"就跳过。
-5. **Windows 产物还没有编出来**（P3 唯一的遗留项）：nvcc 在 Windows 上只认 `cl.exe`，
-   而这台机器没有 VS/MSVC ⇒ 宿主的 `models/rpg_engine.dll` 现在仍是 CPU 版，
-   RPGBar 的 `smoke_test.py` / `ui_check.js` 还没在 CUDA 引擎上跑过。**接口层已经验过了**
-   （Linux 产物 38/0 + 多轮对话），要补的只是工具链。
-6. **进程退出前必须 `unload_model`**：两个注册表（`g_models` / `g_sessions`）是命名空间级
-   静态对象，会话与模型里装着 `DeviceBuffer`，它们的析构会调 `cudaFree` —— 拖到进程退出
-   才析构时，CUDA 上下文可能已经不在了。宿主正常路径（`abi_smoke.py` 也是）都会显式
-   unload，所以这条是"**别写错宿主**"的提醒，不是引擎的缺陷。
+5. ~~**Windows 产物还没有编出来**~~ → **已解决**（P3 第四步，2026-10-13）：
+   `build_win.ps1` + VS Build Tools + Windows 版 Toolkit ⇒ `rpg_engine.dll` 编出来了，
+   `abi_smoke` 38/0、`cuda_check` / `kv_map_check` 全绿，已经换进 RPGBar
+   （`models/rpg_engine_cuda.dll`）并跑通游戏内一轮真实回合。
+   剩下的**不是"能不能编"，而是"分发给谁"**：产物是按 `75;86;89;120` 四架构出的，
+   但**目标机器仍需要 NVIDIA 驱动 + 算力 ≥ 7.5（Turing）**；不满足时宿主会探测出来并
+   置灰 GPU 选项（不是崩，是"这条路的门槛写在界面上"）。
+6. **进程退出前必须 `unload_model` —— 但别把这个责任交给上层**。两个注册表
+   （`g_models` / `g_sessions`）是命名空间级静态对象，会话与模型里装着 `DeviceBuffer`，
+   它们的析构会调 `cudaFree` —— 拖到进程退出才析构时，CUDA 上下文可能已经销毁，
+   刷一屏 `cudaFree 失败：driver shutting down`。
+   ⚠️ **实测踩过**：RPGBar 的 `EngineProvider` 只在 `close()` 里清自己的句柄，而**同一份
+   权重被多个 Provider 共用** ⇒ "谁先退出谁卸"是错的，一百多行警告在退出时刷出来。
+   解法是在引擎侧加一个**按库遍历**的 `engine.unload_all()`，挂到宿主进程的 `atexit` ——
+   它只在"所有人都不再需要"之后才动手。⇒ **资源生命周期的正确归属是"拥有者"，
+   不是"最后一个使用者"**；宿主写错了，症状（退出时的警告屏）离原因（共享权重）很远。
+7. ⚠️ **`.cu` 里的中文字符串在 Windows 产物里是 GBK，`.cc` 里的是 UTF-8**（2026-10-13
+   发现，**尚未修**）。机制与证据见 §8 的"坑 4"。影响面：
+   - **看得见的**：GPU 后端的引擎日志（`[rpg_engine info] …`）在 UTF-8 终端/日志文件里
+     部分乱码；`.cc` 打的那些正常。**游戏本体不受影响**（那是 web 界面，不经过 stdout）。
+   - **看不见的**：这条同时说明 **Windows 上的 CUDA 构建依赖构建机的代码页** ——
+     在非中文代码页的 Windows 上，nvcc 写宿主中间码时会**丢掉**这些中文（转不成 ACP）。
+     所以"在 Windows 上编 CUDA 版"这件事目前只在中文代码页的机器上被验证过。
+   - **不加 `-Xcompiler=/utf-8` 去修**：那会让一部分中文字符串编不过（§8 坑 4 的表）。
+   - **可能的修法**（都还没做，**要先用用户拍板**，因为它等于给"引擎日志用什么编码"定规矩）：
+     ① 在 CUDA 侧的日志 sink 上把 ACP 转成 UTF-8（改动集中在 CUDA 仓库，不动同源副本；
+     但要保证每个 `.cu` 都经过那个 sink，而 `tools/*.cu` 里的直接 `printf` 管不到）；
+     ② 把 `.cu` 里会被打印的中文搬到 `.cc`（实测 `.cc` 侧本来就是对的）；
+     ③ 干脆让引擎日志走 ASCII/英文（最省事，也最"国际化"，但中文开发者读起来更费劲）。
+     ⚠️ 数过：`.cu` / `.cuh` 里**会被打印**的中文串一共 **309 处** ⇒ 逐个改不现实，
+     必须先选一条集中式的路。
+
 
 ## 10. 与 RPGBarEngine 的同步
 
@@ -815,12 +1027,18 @@ git cherry-pick <sha>          # 或 git checkout upstream/main -- src/gguf.cc s
 **跟之前先跑一遍，跟之后再跑一遍**：
 
 ```bash
-python tests/check_sync.py     # 22 个同源副本（20 src + 2 tools）+ 2 个 ABI 文件 = 24 项，逐字节比较
+python tests/check_sync.py     # 23 个同源副本（21 src + 2 tools）+ 2 个 ABI 文件 = 25 项，逐字节比较
+                               # 顺带自检 37 个 .cu/.cuh/.h 的 UTF-8 BOM（§3 末尾讲了为什么）
 python tests/check_sync.py --quiet   # 只看结论，适合放进脚本
 ```
 
 它存在的意义是：**"复制得对不对"不是一次性动作，而是一条随时可以重跑的判据**。
 对拍（§7）要能得出"差异只来自算力层"，前提就是这一层没跑偏。
+
+⚠️ **BOM 让"跟上游"这件事多了一步**：从上游 `git checkout` 一个文件过来之后，
+要确认它**也带 BOM** —— 上游不带，Windows 构建会立刻炸，而且症状
+（`missing closing quote`）看起来像"上游的代码有问题"。这也是那 16 个 BOM 改动
+必须回流上游的原因：**不回流，每次同步都要手工补一次。**
 
 **判断某个上游改动要不要跟**：看它动的是"文本/容器"还是"计算"。
 - 动 `gguf.*` / `tokenizer.*` / `chat_template.*` / `tool_parser.*` → **要跟**（两边行为必须一致）

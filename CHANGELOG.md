@@ -322,17 +322,101 @@
 - ⚠️ **P3 只剩一项没做完**：Windows 侧能加载的 `.dll`。nvcc 在 Windows 上只认 `cl.exe`，
   这台机器没有 VS/MSVC ⇒ `models/rpg_engine.dll` 仍是 CPU 版，RPGBar 的 `smoke_test.py` /
   `ui_check.js` 还没在 CUDA 引擎上跑过。**卡住的是编译器，不是接口。**
+  （→ 2026-10-13 补完，见下面「P3 第四步」。）
 
-### 说明
+### 新增（P3 第四步：Windows 产物 + 接入 RPGBar）
+
+- **`build_win.ps1`**：Windows 侧的构建脚本（`build_wsl.sh` 的对应物）。
+  刻意**不调 vcvars** —— 直接从文件系统推导 `PATH` / `INCLUDE` / `LIB`，全程不碰注册表；
+  显式传 `-DCMAKE_CUDA_COMPILER_TOOLKIT_ROOT` 等，让 `find_package(CUDAToolkit)` 不必去查注册表。
+  **纯 ASCII**（PowerShell 5.1 无 BOM 时按 ANSI 读 `.ps1`，中文注释会吃掉行首字符）。
+- **默认架构改成 `75;86;89;120`**（Turing / Ampere / Ada / Blackwell）：`native` 只出本机 SASS，
+  产物发给别人是"选项亮着、一生成就失败"。`cuobjdump --list-elf` 确认四份 SASS 齐全；
+  产物体积 558,080 B（单 sm_120）→ **1,061,376 B**（四架构）。
+- **`CMakeLists.txt` 的 MSVC 分支修掉一处漏限定**：`add_compile_options(/O2 /utf-8 /fp:precise)`
+  改成三条 `$<$<COMPILE_LANGUAGE:CXX>:...>`。`else()` 分支早有同样的限定与注释，
+  MSVC 分支因为从没在 Windows 上跑过而漏了（见下面的坑 1）。
+- **37 个源文件加 UTF-8 BOM**（`src/` 20 + `tools/` 2 + `include/` 1 个 `.h`，加 14 个 `.cu`/`.cuh`）。
+  ⚠️ **这连带改了上位仓库的 16 个同名文件** —— 带 BOM 的文件里有一半是同源副本，
+  上游不加 BOM，`check_sync.py` 会整批报"第 1 行不同"。两边一起改才自洽。
+- **`tests/check_sync.py` 加一条 BOM 自检**（第二件事，与"副本有没有跑偏"无关）：
+  扫 `include/` / `src/` / `tools/` 下**所有** `.cu` / `.cuh` / `.h`，逐个查开头三个字节。
+  理由：Windows 构建的成败**逐文件判定** —— `.cu` 加了 BOM、它 include 的 `.h` 没加一样炸，
+  而"新加一个头文件时记得加 BOM"这种事靠人记迟早会漏。现在 37/37 带 BOM，
+  负向也验过（临时塞一个无 BOM 的 `.h` ⇒ 立刻报出文件名并 exit=1）。
+- **产物换进 RPGBar**：`models/rpg_engine_cuda.dll`（与 CPU 版**同名同 ABI**，
+  宿主按"能不能用"探测后再选，见下面的说明）。
+
+### 说明（P3 第四步）
+
+- **三个坑，全在工具链与编码上，源码一个字没改就能编过**：
+
+  1. **裸的 MSVC 风格开关会被 nvcc 当成输入文件** —— Windows 上 `/` 也是路径分隔符，
+     `/O2` / `/utf-8` / `/fp:precise` 裸传给 nvcc 就变成"第二个输入文件" ⇒
+     `nvcc fatal : A single input file is required for a non-link phase when an outputfile
+     is specified`（13 个 `.cu` 全挂）。必须用语言限定生成式
+     （`$<$<COMPILE_LANGUAGE:CXX>:/O2>`）—— 与下面那条 `-O2` 落到 CUDA 的坑**同源**，
+     只是一个让编译失败、一个让它悄悄降档。
+     **排查手段**：用一行 `tiny2.cu` **逐级加参数二分**（t1–t15），十几分钟钉死问题开关，
+     而不是盯着 13 个文件的报错猜。
+  2. **`.cu` / `.cuh` / `.h` 必须带 UTF-8 BOM** —— nvcc 在 Windows 上按**本地代码页**（936）
+     读源文件，中文字符串字面量按 GBK 解读时某些字节序列产生**假的反斜杠 `\`**，
+     把结束引号转义掉 ⇒ `error: missing closing quote`（62 次）+ `unrecognized token`，
+     且错误**连锁**到后面几十行。试过并**证伪**的方案：`nvcc -utf-8`（只管 execution charset）、
+     `-Xcompiler=/utf-8`（只影响交给 `cl` 的那半，且实测会**破坏**带 BOM 的文件）、
+     `chcp 65001`、换 clang 当 host（本机只有 ARM64 版 `clang-cl.exe`）。**只认 BOM，且逐文件判**。
+     ⚠️ 只有**中文字符串字面量**会炸；纯中文**注释**无害（预处理阶段就被剥离）。
+     给 `.cu` 加完 BOM 后又暴露 `.h` 也得加（`fatal error C1020: 意外的 #endif`，
+     `cl` 读无 BOM 的 `.h` 时行尾产生 `\` 把结构吃掉）。
+  3. **cudart 是静态链进去的** —— `dumpbin /dependents rpg_engine.dll` 里只有
+     `KERNEL32` / `MSVCP140` / `VCRUNTIME140*` / `api-ms-win-crt-*`，**没有 `cudart64_13.dll`**；
+     `nvcuda.dll` 是**延迟加载**的。这两件事一起改变了宿主侧的分发与探测逻辑
+     （不用带 cudart；而"库能不能加载"与"有没有 N 卡"必须分开判，见 RPGBar 的 `server/engine.py`）。
+
+- **根因是 `nvcc` 每次真正编译都要调 `reg.exe`**（去找 MSVC 与 Windows SDK 的位置）——
+  `nvcc --version` **不调**它，所以之前看不出来。这是唯一的**环境**卡点，
+  放行之后一次编过。
+
+- **Windows 侧实测**（2026-10-13，RTX 5060 Laptop + MSVC + CUDA 13.2）：
+
+  | 项 | 结果 |
+  | --- | --- |
+  | `build_win.ps1` | exit=0，`rpg_engine.dll` **1,061,376 B** |
+  | `abi_smoke.py --lib build-win/rpg_engine.dll --model …` | **38 通过 / 0 失败**（`backend=cuda`） |
+  | `cuda_check.exe` | RTX 5060 Laptop / 算力 **12.0** / 26 SM / 显存 6.9+8.0 GiB；搬运全对 |
+  | `kv_map_check.exe` | PASS |
+  | `check_sync.py`（含新 BOM 判据） | 25 一致 / 0 分叉 / 0 缺失；37/37 带 BOM |
+  | 接入 RPGBar 后 `engine_probe.py --backend gpu` | `实际后端: gpu`；**0.9 s / 15 token（16.3 tok/s）** |
+  | 游戏内三轮真实回合（同一串动作） | GPU **37.5 / 27.7 / 21.5 s** vs CPU **199.3 / 114.4 / 109.2 s** ⇒ **4.1–5.3×** |
+  | 退出时 `cudaFree` 警告 | **0 行** |
+
+- ⚠️ **第四个坑（未修，已记入 DESIGN §9 第 7 条）：`.cu` 里的中文字符串在二进制里是 GBK，
+  `.cc` 里的是 UTF-8。** nvcc 的宿主侧字面量按**执行字符集**（= 系统代码页）落盘，
+  交给 `cl` 的 `/utf-8` 改不动它。实测排除：
+
+  | 试过的 | 结果 |
+  | --- | --- |
+  | `-Xcompiler=/source-charset:.936 -Xcompiler=/execution-charset:utf-8` | **完全无效** —— 字面量在 .obj 里仍是 GBK |
+  | `-Xcompiler=/utf-8` | **能把字面量变成 UTF-8**，但会让**一部分中文字符串编不过**（同一次实验：`"测试"` 通过、`"权重已上卡"` 报 `missing closing quote`）⇒ **不可用** |
+
+  证据：`models/rpg_engine_cuda.dll` 里 `权重已上卡` **同时存在 UTF-8 与 GBK 两份**
+  （`engine.cc:287` 与 `gpu_model.cu:237` 是同一条消息），而 `已创建会话` / `分词器就绪`
+  只有 UTF-8 一份。⇒ 症状是 GPU 后端的引擎日志在 UTF-8 终端上部分乱码。
+  **修法待定**（要么在日志 sink 上把 CUDA 侧的 ACP 转成 UTF-8，要么让 `.cu` 不再带中文
+  字符串），**动之前要先问用户**：它跨到"日志用什么语言/什么编码"这个约定上了。
+
+### 说明（P0）
 
 - **P0 的两档判据全绿**（2026-10-12）。不需要显卡的那一档在 Windows 上跑
   （`check_sync.py` 22 一致 / `abi_smoke.py` 32 通过）；需要显卡的那一档在 WSL +
   CUDA 13.2 上跑（`abi_smoke.py` 32 通过；`cuda_check` 报出 RTX 5060 Laptop / 算力 12.0 /
   26 SM，device 计算与搬运全对）。
+  （数字随阶段推进而变：到 P3 结束时是 25 项 / 38 通过 —— 每一条都记在对应阶段的小节里。）
 - **CUDA 路径的构建放在 WSL 里**，因为 Windows 侧没有 MSVC（而 nvcc 不接受 g++ 当宿主
   编译器）。为此新增 `build_wsl.sh`：源码留在 `/mnt/e`（一份，不会分叉），构建目录落
   WSL 原生 ext4（9p 上的顺序写只有 173 MB/s，原生是 2.5 GB/s）。产物 `librpg_engine.so`
-  供 P0–P2 的算法对拍使用；宿主能加载的 `.dll` 等 P3 时补 MSVC + Windows 版 Toolkit。
+  供 P0–P2 的算法对拍使用；宿主能加载的 `.dll` 等 P3 时补 MSVC + Windows 版 Toolkit
+  （**已于 P3 第四步补完**，见上）。
 - **首次编译抓出两个真问题**（host-only 构建看不到，因为相关代码被 `#ifdef` 掉）：
   `cuda_common.h` 把 `<cuda_runtime.h>` include 进了 `namespace rpg`（libstdc++ 的
   `namespace std` 被嵌套成 `rpg::std`，该 TU 全线崩、报错却全落在标准库内部）；

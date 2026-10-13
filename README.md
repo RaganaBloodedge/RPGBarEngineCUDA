@@ -18,7 +18,7 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 | P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿 |
 | P1 | 权重上卡 + 整网前向对拍 | ✅ **完成** —— 两条判据全绿（见下） |
 | P2 | KV Cache（fp16）+ 增量解码 + 贪心逐 token 对拍 | ✅ **完成** —— 三条判据全绿，**32/32 个 token 与 CPU 引擎完全一致** |
-| P3 | 采样 + **接入 ABI**（`generate` 已实现）/ 工具调用 / 接入 RPGBar | 🔶 **进行中** —— 采样三条判据全绿；**ABI 的 `generate` 已经真的在生成**（`abi_smoke` **38/0**，端到端多轮对话跑通）；还差 Windows 侧 `.dll`（要 MSVC）与 RPGBar 端联调 |
+| P3 | 采样 + **接入 ABI**（`generate` 已实现）/ 工具调用 / 接入 RPGBar | ✅ **完成** —— 采样三条判据全绿；ABI 的 `generate` 真的在生成（`abi_smoke` **38/0**）；**Windows 侧 `.dll` 已编出来并跑通**（`build_win.ps1`），已经换进 RPGBar 的 `models/rpg_engine_cuda.dll`，`smoke_test.py` 258/0、`ui_check.js` 115/0、游戏里真的在 GPU 上出字 |
 | P4 | 融合 kernel、CUDA Graph、量化直算 | 未开始 |
 
 **P1 的一句话结论**：同一份 GGUF、同一串 token，GPU 的 28 层前向与 CPU 引擎**逐层对得上**
@@ -62,25 +62,54 @@ logits，两边就该给出同一个 token）—— u 表 **192/192 位模式相
 `rows × vocab` 的 logits 下载回 host 再取最后一行，这里把**整块搬运省掉了** ——
 `GpuGenerate` 直接吃显存地址，整个 decode 循环只回传 4 个字节。
 
-**工具链现状**：CUDA Toolkit **13.2 已装在 WSL（Ubuntu 24.04）**（`/usr/local/cuda`，
-版本与宿主 `nvidia-smi` 报的 13.2 精确对齐）。Windows 侧仍没有 nvcc / cmake / MSVC ——
-所以 CUDA 路径的构建走 WSL（`bash build_wsl.sh`），产物是 `librpg_engine.so`。
-要出宿主机（Windows）能加载的 `.dll`，得补 **MSVC + Windows 版 Toolkit** ——
-`-static` 与 CUDA 运行时不兼容，所以 Windows 的 CUDA 产物**不能**用 MinGW 编。
-**这是 P3 最后一项没做完的事**，而且它卡住的**只是编译器**：ABI 本身已经在 Linux
-（`librpg_engine.so`）上端到端跑通了，宿主侧的 `models/rpg_engine.dll` 现在仍是 CPU 版。
+**工具链现状**：**两条路都通了**。
+
+- **Windows**：`build_win.ps1` + CUDA Toolkit 13.x + VS Build Tools（只要 MSVC 的 `cl.exe`，
+  不装 IDE）⇒ `rpg_engine.dll`，**宿主直接加载的那一份**。
+- **WSL**：`bash build_wsl.sh` ⇒ `librpg_engine.so`，算力层的日常验证在那边跑。
+
+Windows 这一侧之前卡了很久，根因是 `nvcc` **每次真正编译都要调 `reg.exe`** 去找 MSVC 与
+Windows SDK 的位置（`nvcc --version` 不调，所以看不出来）。放行之后立刻通了；顺手踩到四个
+**只在 Windows 上才会出现**的坑，全部记在 [设计文档 §8](docs/DESIGN.md)：
+
+1. **裸的 MSVC 风格开关会被 nvcc 当成输入文件** —— Windows 上 `/` 也是路径分隔符，
+   `/O2` / `/utf-8` / `/fp:precise` 不能裸传给 nvcc，要写成 `$<$<COMPILE_LANGUAGE:CXX>:...>`。
+2. **`.cu` / `.cuh` / `.h` 必须带 UTF-8 BOM** —— nvcc 按**本地代码页**（936）读源文件，
+   中文字符串字面量会产生假的 `\` 把结束引号转义掉 ⇒ `missing closing quote`，错误还连锁
+   几十行。只认 BOM（`-utf-8` / `chcp 65001` 无效），而且**逐文件判定**，头文件漏加一样炸。
+3. **cudart 是静态链进去的** —— `dumpbin /dependents` 里**没有** `cudart64_13.dll`，
+   分发时不用带；`nvcuda.dll` 是延迟加载，所以"能不能加载这个库"与"有没有 N 卡"是两件事。
+4. ⚠️ **`.cu` 里的中文字符串进二进制是 GBK，`.cc` 里的是 UTF-8**（已知缺陷，未修）——
+   nvcc 的宿主侧代码只按**执行字符集**（= 系统代码页）出字面量，`/utf-8` 交给 `cl` 也改不了
+   （实测 `-Xcompiler=/source-charset:.936 /execution-charset:utf-8` 完全无效，字面量仍是 GBK）。
+   后果：GPU 后端的**引擎日志**在 UTF-8 终端上是乱码（`.cc` 的日志正常），见
+   [设计文档 §9 第 7 条](docs/DESIGN.md)。⚠️ `-Xcompiler=/utf-8` 能把字面量变成 UTF-8，
+   但会让**一部分中文字符串直接编不过**（同一次实验里 `"测试"` 通过、`"权重已上卡"` 报
+   `missing closing quote`）—— **所以它不是可用的解法**，别试。
 
 没有 Toolkit 时这个仓库仍能编译（host 部分），只是 `generate` 会明确报"未编译 CUDA 后端"。
 
 ## 编译
 
-有 CUDA Toolkit：
+### Windows（出宿主能直接加载的 `.dll`）
 
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-./build/cuda_check          # 工具链自检：报出设备名、算力、显存（不需要权重）
+需要 **CUDA Toolkit 13.x** 和 **VS Build Tools**（要 `cl.exe`，不需要整装 Visual Studio）。
+
+```powershell
+./build_win.ps1                 # 产物 build-win/rpg_engine.dll（默认四架构）
+./build_win.ps1 -Clean          # 先清构建目录再编
+./build-win/cuda_check.exe      # 工具链自检：报出设备名、算力、显存（不需要权重）
 ```
+
+默认架构是 **`75;86;89;120`**（Turing / Ampere / Ada / Blackwell）—— 分发给别人的产物
+**不能**用 `native`：那样只出本机 SASS，换台机器就是"选项亮着、一生成就失败"。
+
+⚠️ **源码必须带 UTF-8 BOM**，`.cu` / `.cuh` / `.h` 一个都不能漏（`check_sync.py` 也盯着
+这一点，见下）。`build_win.ps1` 刻意**不调 vcvars**，直接从文件系统推导 `PATH` / `INCLUDE` /
+`LIB`，全程不碰注册表；它是**纯 ASCII** —— PowerShell 5.1 无 BOM 时按 ANSI 读 `.ps1`，
+中文注释会吃掉行首字符。
+
+### WSL / Linux
 
 **在 WSL 里编 CUDA 版**（源码留在 `/mnt/e`，构建目录落 WSL 原生 ext4 —— 理由见 `build_wsl.sh` 头部）：
 
@@ -90,14 +119,26 @@ bash build_wsl.sh --clean               # 先清构建目录再编
 ~/cuda-build/cuda_check                 # 工具链自检
 ```
 
-**没装 Toolkit / 没装 cmake**（只要一个 g++ 就能编 host 部分）：
+### 有 Toolkit 时的通用步骤
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/cuda_check          # 工具链自检：报出设备名、算力、显存（不需要权重）
+```
+
+### 没有 Toolkit / 没有 cmake
+
+只要一个 g++ 就能编 host 部分：
 
 ```bash
 bash build_host.sh          # 产物 build/rpg_engine.dll（host-only）
 ```
 
+> 注意 `-static` 与 CUDA 运行时不兼容，所以 Windows 的 **CUDA** 产物**不能**用 MinGW 编 ——
+> 走上面的 MSVC 路径。
+
 本机 GPU 是 **RTX 5060 Laptop（8 GB，Blackwell sm_120）**，需要 CUDA **12.8+**。
-跨机器分发产物时**不要**用 `-DCMAKE_CUDA_ARCHITECTURES=native`，要显式列出目标架构。
 
 ## 验证
 
@@ -105,9 +146,14 @@ P0 的判据分两档。**不需要显卡的那档在 Windows 上跑**：
 
 ```bash
 python tests/check_sync.py      # 23 个同源副本（21 src + 2 tools）+ 2 个 ABI 文件 = 25 项逐字节一致
-python tests/abi_smoke.py --lib build/rpg_engine.dll
-python tests/abi_smoke.py --lib build/rpg_engine.dll --model models/Qwen3-1.7B-Q4_K_M.gguf
+python tests/abi_smoke.py --lib build-win/rpg_engine.dll
+python tests/abi_smoke.py --lib build-win/rpg_engine.dll --model models/Qwen3-1.7B-Q4_K_M.gguf
 ```
+
+> `check_sync.py` 现在**顺便盯着 BOM**：Windows 侧的 nvcc 要求 `.cu` 与所有 `.h` 带
+> UTF-8 BOM，而这些文件有一半是"逐字节复制"的同源副本 ⇒ 上游（RPGBarEngine）同名文件
+> 也必须带 BOM，否则 16 项会一起报"第 1 行不同"。所以这条判据同时是**跨平台构建的前提**，
+> 不只是"副本有没有跑偏"。
 
 **需要显卡的那档在 WSL 里跑**：
 
@@ -133,9 +179,15 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 
 | 项 | 环境 | 结果 |
 | --- | --- | --- |
-| `check_sync.py` | WSL | **25 一致 / 0 分叉 / 0 缺失**（21 src + 2 tools 副本 + 2 个 ABI 文件） |
-| `abi_smoke.py`（host-only，带真实权重） | Windows | 32 通过 / 0 失败 |
-| `abi_smoke.py`（CUDA 产物，带真实权重） | WSL | 32 通过 / 0 失败 |
+| `check_sync.py` | WSL / Windows | **25 一致 / 0 分叉 / 0 缺失**（21 src + 2 tools 副本 + 2 个 ABI 文件），BOM 也对齐了 |
+| `abi_smoke.py`（host-only，带真实权重） | Windows | 38 通过 / 0 失败 |
+| **`abi_smoke.py`（CUDA 产物，带真实权重）** | **Windows + MSVC** | **38 通过 / 0 失败**（`backend=cuda`、`generate` 真的出 JSON） |
+| `abi_smoke.py`（CUDA 产物，带真实权重） | WSL | 38 通过 / 0 失败 |
+| **`build_win.ps1`**（Windows 多架构构建） | Windows + MSVC + CUDA 13.2 | exit=0；`rpg_engine.dll` **1,061,376 B**（单架构 sm_120 时是 558,080 B） |
+| **`cuobjdump --list-elf`** | Windows | **`sm_75` / `sm_86` / `sm_89` / `sm_120` 四份 SASS 齐全** ⇒ 分发给别人不会"亮着能选、一生成就失败" |
+| **`dumpbin /dependents`** | Windows | 只有 `KERNEL32` / `MSVCP140` / `VCRUNTIME140*` / `api-ms-win-crt-*`；**没有 cudart、没有 nvcuda** ⇒ 分发不用带 `cudart64_13.dll`，且"库能加载"与"有没有驱动"必须分开判 |
+| **`cuda_check.exe`** | **Windows + MSVC** | RTX 5060 Laptop / 算力 **12.0** / 26 SM / 显存 6.9+8.0 GiB / CUDA 驱动 13.2；device 计算 + 搬运全对 |
+| **`kv_map_check.exe`** | **Windows + MSVC** | PASS —— KV 写入的下标映射与边界都正确 |
 | `cuda_check` | WSL + CUDA 13.2 | RTX 5060 Laptop / 算力 **12.0** / 26 SM / 显存 6.9+8.0 GiB；device 计算 + 搬运全对 |
 | **`dequant_check`**（P1 ①） | WSL + CUDA 13.2 | f16→f32 穷举 65536 值全对；反量化 131072 个元素 **0 个 bit 不同** |
 | **`tests/run_p1.sh`**（P1 ②） | WSL + CUDA 13.2 | 残差流 29 项 p99 ≤ **1.05e-4**（判据 1e-3）；logits p99 5.98e-5；argmax **21/21** 一致 |
@@ -149,6 +201,10 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 | **回归 `run_p1.sh`** | WSL + CUDA 13.2 | 29 项最差 p99 **1.05e-4**；logits max\|Δ\| **1.431e-4**（与 P1 记录一致） |
 | **`abi_smoke.py`（CUDA 产物 + 真实生成）**（P3 ③） | WSL + CUDA 13.2 | **38 通过 / 0 失败** —— 含 6 条 `generate` 断言（返回非空 / 合法 JSON / 四个键 / `finish_reason` 取值 / `usage` 字段） |
 | **端到端多轮生成**（`ctypes` 直调 ABI） | WSL + CUDA 13.2 | 单轮 `finish=stop`、文本通顺；同会话第二轮**前缀复用**生效（`prompt_tokens` 17 → 37）；权重上卡 **1.05 GiB / 6.6–8.9 s**；会话 KV（1024）**112 MiB** |
+| **`engine_probe.py --backend gpu`**（RPGBar 仓库） | **Windows + CUDA 产物** | `实际后端: gpu`；`device_bytes 1122428928`；**0.9 s / 15 token（16.3 tok/s）**；工具调用正常；**退出时 `cudaFree` 警告 0 行** |
+| **游戏内端到端**（RPGBar 服务器，同一串动作 × 3 轮） | **Windows + CUDA 产物** | configure 后 `lib_name: "rpg_engine_cuda.dll"` / `backend: "gpu"` / `backend_fallback: false`；三轮 **37.5 / 27.7 / 21.5 s**（CPU 同串动作 **199.3 / 114.4 / 109.2 s**）⇒ **快 4.1–5.3×**；日志里 `已创建会话（模型 #1，缓存容量 6144，KV 约 672 MiB）` + `设备: NVIDIA GeForce RTX 5060 Laptop GPU`；**0 条降级** |
+| **`scripts/smoke_test.py --unit`**（RPGBar 仓库） | Windows | **258 通过 / 0 失败**（GPU 探测用例 4 → 5 条） |
+| **`ui_check.js`**（RPGBar 仓库，真服务器） | Windows | **115 通过 / 0 失败** |
 
 ### P1 实测（21 token prefill，同一 prompt / 同一份 GGUF）
 
@@ -184,6 +240,28 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 
 两个数字都离 P4 的 60 tok/s 目标还远，而且**离瓶颈很远**：decode 每步约 400 次 kernel
 启动 + 一次同步才是主因（见上面 P2 那张表）。采样加进去的是"几步 kernel"，不是"几百步"。
+
+### P3 第三步的实测（Windows 产物，即宿主真正加载的那一份）
+
+| 项 | 实测 |
+| --- | --- |
+| 产物 | `rpg_engine.dll` **1,061,376 B**（四架构 SASS），依赖里**没有 cudart** |
+| 权重上卡 + 一次生成 | `engine_probe.py --backend gpu`：**0.9 s / 15 token（16.3 tok/s）**；`device_bytes 1,122,428,928`（约 1.05 GiB） |
+| 游戏里三轮真实回合（同一串动作，含 DM 的工具循环与 NPC 预备） | GPU **37.5 / 27.7 / 21.5 s** vs CPU **199.3 / 114.4 / 109.2 s** ⇒ **4.1× / 4.1× / 5.1×** |
+| 退出时的显存回收 | **`cudaFree` 警告 0 行**（`engine.unload_all()` 挂在 `atexit`，见 DESIGN §9 第 6 条） |
+
+> ⚠️ **别把"一次生成本身"和"一轮游戏回合"混着比**：`16.3 tok/s` 是单次 decode 的口径
+> （15 个 token），而"一轮回合"里 DM 会跑好几趟模型（工具循环 + 提到 NPC 时再跑一轮），
+> 所以 37.5 s 不是 16.3 tok/s 乘出来的。
+> 那张对比表才是玩家真正感受得到的数字 —— 也是它才值得写进简历/README 的那一个。
+>
+> 📌 **两轮 4.1× 与一轮 5.1× 的差别不是误差，是"这轮跑了几个模型调用"**：
+> 第 1 轮冷启动（权重首次上卡后的第一次前向）偏慢，第 2、3 轮的差距来自各自的调用数。
+> 三个数一起报，是为了让人看得出波动来自哪。
+
+> ⚠️ **16.3 tok/s 与 P2 的 18.5 / P3 的 16.6 是同一量级的运行间波动**，别把 Windows 与
+> WSL 的差当成平台差异 —— 它们跑的是同一段 `GpuGenerate`。真正的平台差异只有一个：
+> Windows 产物**把 cudart 静态链进去了**，所以宿主分发时不用额外带 `cudart64_13.dll`。
 
 ### ⚠️ 首次真编译（P0 / P1 / P2 各一次）暴露的真问题
 
@@ -227,6 +305,14 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 **写下"断言未来行为"的测试时，就得顺手记下"什么时候该来改它"**，否则它会安静地
 变成一道"只有实现退化时才通过"的假绿灯。
 
+**Windows 构建（P3 收尾）是唯一一次"坑不在代码里"的**：卡了整整一轮，根因全是
+**工具链与编码**，源码一个字没改就能编过。三个坑按顺序是：nvcc 把裸的 `/O2` 当输入文件
+（13 个 `.cu` 全挂）→ 中文按 GBK 解读产生假 `\`，把字符串的结束引号转义掉
+（`missing closing quote`，62 次）→ 给 `.cu` 加 BOM 后又暴露 `.h` 也得加
+（`fatal error C1020: 意外的 #endif`）。**排查手段值得记**：用一行 `tiny2.cu`
+**逐级加参数二分**（t1–t15），十几分钟就把"哪个开关有问题"钉死了 —— 而不是盯着 13 个
+文件的 62 条报错猜。详细过程见 [设计文档 §8](docs/DESIGN.md)。
+
 ## 用起来
 
 产物是 `rpg_engine.dll` / `librpg_engine.so`，与 CPU 版**同名同 ABI**。
@@ -236,10 +322,18 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 python scripts/engine_probe.py     # 在 RPGBar 仓库里跑，会打印引擎版本与实测 tok/s
 ```
 
+⚠️ 宿主侧现在**按库名分开**：CPU 版是 `models/rpg_engine.dll`，CUDA 版是
+`models/rpg_engine_cuda.dll`（同一份 ABI，宿主按"能不能用"探测后再选，见 RPGBar 的
+`server/engine.py`）。**分发 CUDA 产物时不需要带 `cudart64_*.dll`** —— 它已经静态
+链进 `.dll` 里了；但**需要**目标机器有 NVIDIA 驱动 + 支持算力 ≥ 7.5（Turing）的卡。
+
 ## 目录
 
 ```
 include/rpg_engine.h    ← 逐字复制自 RPGBarEngine，是唯一契约（两边都不许单独改）
+build_win.ps1           ← Windows 构建（MSVC + Windows 版 Toolkit）→ build-win/rpg_engine.dll
+build_wsl.sh            ← WSL 构建（工具链顺手，算法验证都在那边跑）→ ~/cuda-build/librpg_engine.so
+build_host.sh           ← 连 cmake / nvcc 都没有时的 host-only 兜底构建
 src/                    ← host 层：ABI（engine.cc —— 会话管理 + 九步 generate）、GGUF、分词器、
                             ChatML、工具解析、元数据推导（复用/新增）
                           + CUDA 计算层（重写）：gpu_model.cu（权重上卡）
@@ -274,3 +368,7 @@ MIT。
 这是故意的，理由见 [设计文档 §3](docs/DESIGN.md)：副本保持逐字节一致，
 对拍才能得出"差异只来自算力层"，跟上游的修复也才是一条 `git checkout` 的事。
 跑 `python tests/check_sync.py` 可以随时确认它们没跑偏。
+
+> ⚠️ **逐字节一致现在包含"带不带 UTF-8 BOM"**：Windows 侧的 nvcc 按本地代码页读源文件、
+> 不认 `-utf-8`，`src/` 下这一层又有一半是中文字符串，所以两边同名文件**都带 BOM**。
+> 这不是风格问题 —— 去掉任意一边的 BOM，Windows 构建会立刻报 `missing closing quote`。
