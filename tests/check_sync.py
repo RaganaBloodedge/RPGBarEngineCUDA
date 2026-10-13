@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check_sync.py —— 校验"同源副本"有没有和上位仓库跑偏。
+r"""check_sync.py —— 校验"同源副本"有没有和上位仓库跑偏，以及源码该带的 BOM 在不在。
 
 ## 它解决什么问题
 
@@ -13,6 +13,21 @@
 所以"复制得对不对"不是一次性的动作，而是一条**随时可以重跑的判据**。这个脚本
 就是那条判据。改了任何一边的副本之后跑一遍，能立刻看出哪几个文件分叉了。
 
+## 为什么还要查 BOM（第二件事）
+
+Windows 侧的 `nvcc` **按本地代码页（936）读源文件，且只认 UTF-8 BOM**：
+`-utf-8` 无效、`-Xcompiler=/utf-8` 管不到它自己的词法器、`chcp 65001` 无效。
+不带 BOM 时中文字符串字面量会按 GBK 解读，某些字节序列产生**假的反斜杠 `\`**，
+把字符串的结束引号转义掉 ⇒ `error: missing closing quote`，而且错误会**连锁**
+到后面几十行（实测 62 次）。纯中文**注释**无害 —— 只有字符串字面量会炸。
+
+于是"源码必须带 BOM"变成了 Windows 构建的硬前提，而**判断标准是逐文件的**：
+`.cu` 加了、它 include 的 `.h` 没加，一样炸（`fatal error C1020: 意外的 #endif`）。
+这条太容易被下一次"新加一个头文件"破坏，所以放进判据里 —— 而不是写在文档里等人记。
+
+⚠️ 它同时**约束上位仓库**：带 BOM 的文件里有一半是同源副本，上游同名文件不加 BOM，
+上面那个逐字节比较就会整批报"第 1 行不同"。两边一起改才自洽。
+
 ## 用法
 
     # upstream 默认取 ../RPGBarEngine（两个仓库并排放的情况）
@@ -24,7 +39,7 @@
     # CI / 脚本里用：有分叉时退出码非 0
     python tests/check_sync.py --quiet
 
-退出码：0 = 全部一致；1 = 有分叉或缺失；2 = 找不到上位仓库（不算错，只提示）。
+退出码：0 = 全部一致；1 = 有分叉、缺失或 BOM 不对；2 = 找不到上位仓库（不算错，只提示）。
 
 ## 分叉了怎么办
 
@@ -32,6 +47,8 @@
   （`git checkout upstream/main -- src/gguf.cc src/gguf.h`），再跑一遍本脚本确认。
 - 本仓库**有意**要改某个副本 → 那说明它不该再留在"复用"那一栏，
   要同时改 docs/DESIGN.md §3 的表格。**不要偷偷改**。
+- **BOM 报了** → 给文件补 BOM（`b"\xef\xbb\xbf"` 打头），别用编辑器"另存为 UTF-8"
+  时顺手去掉 —— 那正是这条判据要拦的事。
 """
 from __future__ import annotations
 
@@ -71,6 +88,16 @@ ABI_FILES = [
 # 两边不一致会表现为"对拍脚本报形状不符"，而去查模型 —— 又是一次归因跑偏。
 # ⚠️ 复制过来之后**不许改**；要改就先改上游，再同步（docs/DESIGN.md §10）。
 REUSED_TOOLS = ["npy.h", "cli_util.h"]
+
+# --- Windows 构建的硬前提：nvcc 只认 UTF-8 BOM（见文件头）---
+# 覆盖范围 = **nvcc 会去读的每一个源文件**：.cu / .cuh 自己，以及它们 include 的 .h。
+# 这里按目录扫，不按"谁被 include 了"算 —— 后者要解析 include 图，而且**漏一个就炸**。
+# `.cc` 不在内：它们是 cl 用 `/utf-8` 编的（host 侧），nvcc 的词法器碰不到。
+BOM = b"\xef\xbb\xbf"
+BOM_EXTS = (".cu", ".cuh", ".h")
+BOM_DIRS = ("include", "src", "tools")
+# 确实需要豁免的（相对仓库根的 posix 路径）写这里，**并在注释里写清理由**。
+BOM_EXEMPT: set[str] = set()
 
 
 def human_size(n: int) -> str:
@@ -150,6 +177,28 @@ def main() -> int:
     for f in REUSED_TOOLS:
         compare(os.path.join("tools", f), os.path.join("tools", f))
 
+    # --- BOM 自检（与上面那个比较无关：这是本仓库自己的约束）---
+    print("\n== BOM（Windows 侧 nvcc 的硬前提）==")
+    bom_ok = bom_bad = 0
+    for d in BOM_DIRS:
+        for dirpath, _dirnames, filenames in os.walk(os.path.join(root, d)):
+            for name in sorted(filenames):
+                if not name.endswith(BOM_EXTS):
+                    continue
+                rel = os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/")
+                if rel in BOM_EXEMPT:
+                    continue
+                head = open(os.path.join(root, rel), "rb").read(len(BOM))
+                if head == BOM:
+                    bom_ok += 1
+                    if not args.quiet:
+                        print(f"  [有 BOM]  {rel}")
+                else:
+                    bom_bad += 1
+                    bad.append(f"{rel}（缺 UTF-8 BOM ⇒ nvcc 会按代码页 936 读它）")
+                    print(f"  [缺 BOM]  {rel:<28} ← 补上 b'\\xef\\xbb\\xbf'，见文件头")
+    print(f"  检查了 {bom_ok + bom_bad} 个 .cu/.cuh/.h：{bom_ok} 个带 BOM，{bom_bad} 个没有")
+
     print(f"\n结果：{same} 一致，{diff} 分叉，{missing} 缺失")
     if bad:
         print("\n需要处理：")
@@ -158,7 +207,7 @@ def main() -> int:
         print("\n跟法见 docs/DESIGN.md §10。若是**有意**分叉，"
               "要同时改 §3 的复用表 —— 不要偷偷改。")
         return 1
-    print("同源副本与上位仓库逐字节一致。")
+    print("同源副本与上位仓库逐字节一致，且源码都带 UTF-8 BOM。")
     return 0
 
 
