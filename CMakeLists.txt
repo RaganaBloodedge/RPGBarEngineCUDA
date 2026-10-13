@@ -212,4 +212,15 @@ if(RPG_HAS_CUDA)
   # ⚠️ 这里刻意**不**与 CPU 版逐 token 对拍：接在模型后面的采样两边先差了 fp16
   # 的舍入，硬对拍只会得到一个查不清的混合指标（DESIGN §6 第 10 条）。
   rpg_add_tool(gen_sample_check tools/gen_sample_check.cu)
+  # P4 判据：**CUDA Graph 路径**。要模型、要权重。
+  #   正确性 = 同 prompt + 同 seed 下"图路径 == 老路径"**逐位相同**（贪心 / 纯采样 /
+  #   带筛选的采样各一组）；另有一条**必须**的防御：断言 graph_exec != nullptr ——
+  #   因为 GenerateGraph 录不出图时会静默退回老路径，那样"老路径 vs 老路径"也会
+  #   全绿，一行新代码都没跑到。
+  #   性能 = prefill / decode tok/s（目标 decode >= 60、prefill >= 1000）。
+  rpg_add_tool(graph_check tools/graph_check.cu)
+  # kernel 级基准：**权重矩阵读一遍要多久**。只测时间、不验数值。
+  # 存在的理由：P4 的 CUDA Graph 只带来 1.09x ⇒ 瓶颈不在启动开销上，
+  # 那就必须先把"一层前向的时间花在哪"量出来（见该文件头注释）。
+  rpg_add_tool(matmul_bench tools/matmul_bench.cu)
 endif()
