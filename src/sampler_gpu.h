@@ -111,6 +111,28 @@ void GpuSampleToken(const float* logits_dev, int64_t n, const SampleOptions& opt
                     uint64_t seed, uint64_t counter, float* probs_dev,
                     int32_t* out_idx_dev);
 
+// ---------------------------------------------------------------- 图路径（P4）
+//
+// CUDA Graph 回放时每个 kernel 参数都是捕获那一刻的值，所以 counter 与 u 都不能
+// 由 host 传进去 —— 否则回放出来的图每一步都用同一个 u（症状：模型像在复读，
+// 实际是随机源没动）。下面一对接口让它们**全程留在设备端**：
+//
+//   * `counter_dev` 直接指向引擎的 pos0 暂存区 —— 采样用的 counter 就是"这个
+//     token 将要落进 cache 的绝对位置"，而那一步前向的 pos0 是同一个数
+//     （CPU 版 Generate 里两者都取 kv->len()）；
+//   * u 由设备端 kernel 从 counter 算出，写进一块固定地址的显存。
+//
+// 语义与 `GpuSampleToken` **完全相同**（同一个 argmax 分支、同一个逆变换 kernel、
+// 同一份 SplitMix64 核心），差别只在 u 从哪来。判据：同 seed + 同 counter ⇒
+// 两条路径逐位相同（tools/graph_check.cu）。
+void GpuSampleTokenDev(const float* logits_dev, int64_t n, const SampleOptions& opt,
+                       uint64_t seed, const uint64_t* counter_dev, float* probs_dev,
+                       int32_t* out_idx_dev);
+
+// 图路径在 `cudaStreamBeginCapture` **之前**必须调一次：让 u 的落点先分配出来
+// —— 捕获期间 cudaMalloc 是非法操作。见 .cu 里的说明。
+void GpuSamplerWarmup();
+
 }  // namespace rpg
 
 #endif  // RPG_HAS_CUDA

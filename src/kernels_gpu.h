@@ -95,10 +95,28 @@ void GpuKvWrite(const float* k_dev, const float* v_dev, int32_t n_kv_heads,
 //   max_seq    : 一个头占的位置数（= 头与头之间的步长）
 // 位置 pos = pos0 + t 能看到 cache 里 [0, pos] 的全部历史 —— 包括本段里排在它
 // 前面的（它们上一步已经写进去了），因果性自然成立，不需要额外的掩码。
+//
+// ⚠️ `sh_positions` 决定 kernel 里的 scores 共享内存按**多少个位置**备。
+//   * 省略（< 0）⇒ 按 `pos0 + seq`。这是 P2 起就在用的口径，逐字不变。
+//   * 显式给值 ⇒ 按它备。**CUDA Graph 路径必须给** `kv->max_seq()`：shared memory
+//     的大小是启动参数、会被录进图，而回放时 pos0 每步递增 —— 照捕获那一刻的
+//     pos0 备，第 2 步起就越界写（症状同样是"第一个 token 对、之后慢慢跑偏"）。
 void GpuAttentionFromCache(const ModelMeta& c, int64_t pos0, const float* q_dev,
                            int64_t seq, const uint16_t* k_layer,
                            const uint16_t* v_layer, int64_t max_seq,
-                           float* out_dev);
+                           float* out_dev, int64_t sh_positions = -1);
+
+// 把 AttentionFromCacheKernel 的动态共享内存上限**在捕获之前**抬到位。
+//
+// 为什么必须单独有这么个入口：`cudaFuncSetAttribute` 是**非法**的捕获期 API
+// （它改的是函数属性，图里没有这种节点），而 scores 的共享内存大小是启动参数、
+// 会被录进图 ⇒ 图路径只能按 `max_seq` 一次备够，也就只能在 BeginCapture 之前
+// 把这个上限抬好。CaptureDecodeStep 就是先调它、再 BeginCapture。
+//
+// 参数就是它将要用的位置数（图路径传 `kv->max_seq()`）。**幂等**：不超过
+// 48 KiB 时什么都不做 —— 1.7B/4B 在 RPGBar 的上下文上限（6144）下正是这种情况，
+// 于是这条在默认配置里是个空操作，不会悄悄动全局函数属性。
+void GpuAttentionWarmupShmem(int64_t sh_positions);
 
 // 设备端 argmax：把**最大值的下标**写到 out_idx_dev（1 个 int32）。
 // **并列时取最小下标**，与 CPU 版 kernels.h 的 ArgMax 同语义（`x[i] > bv`

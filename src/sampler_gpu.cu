@@ -26,6 +26,35 @@
 namespace rpg {
 namespace {
 
+// ---------------------------------------------------------------- 随机源的核心
+//
+// 这三行**只写一遍**，host 侧（DevSplitMix64 / DevCounterRng / DevCounterUniform
+// 三个对外入口）与 device 侧（CounterUniformKernel）共用 —— `__host__ __device__`
+// 让同一份源码两边都编。
+//
+// 为什么费这个劲：CUDA Graph 路径要求 u 在**设备端**算出来（counter 每步递增，
+// host 算好的 u 会被录进图、回放时永远是第一个随机数），而"把这三行整数运算抄一份
+// 进 kernel"正是 sampler_gpu.h 里警告过的漂移源。共用实现让"两边一致"变成构造
+// 保证，而不是靠判据去发现不一致。
+//
+// ⚠️ 下面那三个对外入口的**签名与语义一个字没变** —— tools/sample_check.cu 与
+// tests/cmp_sample.py 的 u 表仍然盯着"与 CPU 版逐位相同"这条。
+__host__ __device__ uint64_t SplitMix64Core(uint64_t x) {
+  x += 0x9E3779B97F4A7C15ull;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  return x ^ (x >> 31);
+}
+
+__host__ __device__ uint64_t CounterRngCore(uint64_t seed, uint64_t counter) {
+  return SplitMix64Core(seed + 0x9E3779B97F4A7C15ull * counter);
+}
+
+__host__ __device__ float CounterUniformCore(uint64_t seed, uint64_t counter) {
+  const uint32_t bits = static_cast<uint32_t>(CounterRngCore(seed, counter) >> 40);
+  return static_cast<float>(bits) * (1.0f / 16777216.0f);
+}
+
 constexpr int kSampleThreads = 1024;
 
 void CheckLaunch(const char* what) {
@@ -273,9 +302,18 @@ __global__ void FilterProbsKernel(const float* __restrict__ logits, int64_t n,
 // 代价：n = 151936（真实词表）时一条 ~0.5 ms 的串行链。decode 一步现在要 54 ms，
 // 占比 ~1%。**P4 想省这点可以改成"并行算分块和 + 串行定块"**，那时要接受
 // "u 贴近边界（~1e-7）时可能与 CPU 差一个 token"这个前提；现在不必付这个代价。
+// ⚠️ `u_dev` 是**设备指针**而不是值参：CUDA Graph 回放时 kernel 参数被固定，
+// 值参会让每一步都用同一个 u（采样退化成"每步同一个随机数"，看起来像模型在
+// 复读，实际是随机源没动）。从显存读就没有这个问题，而且顺带让
+// "counter 在设备端算 u" 那条路径（CounterUniformKernel）能复用同一个 kernel。
+//
+// `static_cast<double>(*u_dev)` 与老版的 `(double)u`（u 是 float）**同值** ——
+// P3 的判据不因此改变一个 bit。
 __global__ void InverseSampleKernel(const float* __restrict__ probs, int64_t n,
-                                    double u, int32_t* __restrict__ out_idx) {
+                                    const float* __restrict__ u_dev,
+                                    int32_t* __restrict__ out_idx) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  const double u = static_cast<double>(*u_dev);
   double cum = 0.0;
   for (int64_t i = 0; i < n; ++i) {
     cum += static_cast<double>(probs[i]);
@@ -297,6 +335,18 @@ __global__ void InverseSampleKernel(const float* __restrict__ probs, int64_t n,
   *out_idx = bi;
 }
 
+// 把 u = H(seed, counter) 也放到**设备端**算 —— 图路径必须这样（理由见
+// InverseSampleKernel 上面那段）。
+//
+// ⚠️ `counter_dev` 指向的就是 **pos0 暂存区**：采样用的 counter 是"这个 token
+// 将要落进 cache 的绝对位置"，而那一步前向的 pos0 是同一个数（CPU 版 Generate
+// 里两者都取 kv->len()）。共用一个标量是有意的 —— 少一个可能对不上的地方。
+__global__ void CounterUniformKernel(uint64_t seed,
+                                     const uint64_t* __restrict__ counter_dev,
+                                     float* __restrict__ u_dev) {
+  *u_dev = CounterUniformCore(seed, *counter_dev);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- 随机源
@@ -305,23 +355,40 @@ __global__ void InverseSampleKernel(const float* __restrict__ probs, int64_t n,
 // 三行整数运算 + 乘一个 2 的幂，所以两边对拍的判据是"逐位相同"。
 // ⚠️ 这里的"逐字对应"是**重写**而非复制（sampler.cc 不在本仓库，见 sampler_gpu.h），
 // 所以它就是那种"改一边忘了另一边"的典型 —— 判据（sample_check 的 u 表）盯着它。
-uint64_t DevSplitMix64(uint64_t x) {
-  x += 0x9E3779B97F4A7C15ull;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-  return x ^ (x >> 31);
-}
+uint64_t DevSplitMix64(uint64_t x) { return SplitMix64Core(x); }
 
 uint64_t DevCounterRng(uint64_t seed, uint64_t counter) {
-  return DevSplitMix64(seed + 0x9E3779B97F4A7C15ull * counter);
+  return CounterRngCore(seed, counter);
 }
 
 float DevCounterUniform(uint64_t seed, uint64_t counter) {
-  const uint32_t bits = static_cast<uint32_t>(DevCounterRng(seed, counter) >> 40);
-  return static_cast<float>(bits) * (1.0f / 16777216.0f);
+  return CounterUniformCore(seed, counter);
 }
 
 // ---------------------------------------------------------------- 对外接口
+
+namespace {
+
+// u 的落点。**地址固定**才能进 CUDA Graph（else 回放时 kernel 参数里的地址失效）；
+// 与 pos0 暂存区同款做法，同样**故意不释放** —— 析构期的 cudaFree 会在 CUDA 上下文
+// 已销毁时刷一屏警告（DESIGN §9.6）。4 个字节，进程退出时驱动回收。
+float* g_u_staging = nullptr;
+
+float* UStagingPtr() {
+  if (g_u_staging == nullptr) {
+    float* p = nullptr;
+    RPG_CUDA_CHECK(cudaMalloc(&p, sizeof(float)));
+    g_u_staging = p;
+  }
+  return g_u_staging;
+}
+
+}  // namespace
+
+// 图路径在 **cudaStreamBeginCapture 之前**必须调一次：捕获期间 cudaMalloc 是非法
+// 操作，而 u 的落点要到第一次采样才分配 —— 不预热就会在捕获窗口里踩到它，症状是
+// cudaStreamEndCapture 返回一个看不出根因的 cudaErrorStreamCaptureUnsupported。
+void GpuSamplerWarmup() { (void)UStagingPtr(); }
 
 void GpuFilterToProbs(const float* logits_dev, int64_t n, const SampleOptions& opt,
                       float* probs_dev) {
@@ -330,8 +397,8 @@ void GpuFilterToProbs(const float* logits_dev, int64_t n, const SampleOptions& o
             static_cast<long long>(n));
   RPG_CHECK(n <= 0x7FFFFFFF, "vocab size exceeds int32 indexing (%lld)",
             static_cast<long long>(n));
-  FilterProbsKernel<<<1, kSampleThreads>>>(logits_dev, n, opt.temperature,
-                                           opt.top_k, opt.top_p, probs_dev);
+  FilterProbsKernel<<<1, kSampleThreads, 0, EngineStream()>>>(
+      logits_dev, n, opt.temperature, opt.top_k, opt.top_p, probs_dev);
   CheckLaunch("FilterProbsKernel");
 }
 
@@ -343,7 +410,17 @@ void GpuInverseSample(const float* probs_dev, int64_t n, float u,
   // ⚠️ u 必须是 [0,1)：约 1 时那个 `cum > u` 可能永远不成立（走兜底分支）。
   RPG_CHECK(u >= 0.0f && u < 1.0f, "u must be in [0,1), got %g",
             static_cast<double>(u));
-  InverseSampleKernel<<<1, 1>>>(probs_dev, n, static_cast<double>(u), out_idx_dev);
+  // ⚠️ 这条路径**不能**在图捕获里跑：下面那次 cudaMemcpyAsync 的源是**栈上的 u**，
+  // 被录进图之后那个地址就失效了 ⇒ 回放时读到野内存。图路径请用
+  // GpuSampleTokenDev（u 在设备端算，全程不碰 host）。宁可在这里明确报错，
+  // 也不要静默出错 —— 那种错看起来只是"生成质量突然变差"。
+  RPG_CHECK(!StreamIsCapturing(),
+            "GpuInverseSample passes u by value and is therefore not capturable; "
+            "use GpuSampleTokenDev inside a CUDA Graph");
+  float* u_dev = UStagingPtr();
+  RPG_CUDA_CHECK(cudaMemcpyAsync(u_dev, &u, sizeof(float), cudaMemcpyHostToDevice,
+                                 EngineStream()));
+  InverseSampleKernel<<<1, 1, 0, EngineStream()>>>(probs_dev, n, u_dev, out_idx_dev);
   CheckLaunch("InverseSampleKernel");
 }
 
@@ -360,6 +437,35 @@ void GpuSampleToken(const float* logits_dev, int64_t n, const SampleOptions& opt
   const float u = DevCounterUniform(seed, counter);
   GpuFilterToProbs(logits_dev, n, opt, probs_dev);
   GpuInverseSample(probs_dev, n, u, out_idx_dev);
+}
+
+// 图路径专用的采样：counter 与 u 都不经过 host。
+//
+// 与 GpuSampleToken 的**唯一**语义差别是 u 的来源（设备端 vs host 现算），
+// token 的选择规则一字不差 —— 两条路径必须给出同一个 token，判据见
+// tools/graph_check.cu（同 seed + 同 counter ⇒ 逐位相同）。
+void GpuSampleTokenDev(const float* logits_dev, int64_t n, const SampleOptions& opt,
+                       uint64_t seed, const uint64_t* counter_dev, float* probs_dev,
+                       int32_t* out_idx_dev) {
+  // 贪心不消耗随机数 —— 与 GpuSampleToken / CPU 版 SampleToken 的**第一条分支**
+  // 同序。这条让"图路径下 T=0 仍然逐位等于 P2 的贪心"变成构造保证。
+  if (!(opt.temperature > 0.0f)) {
+    RPG_CHECK(logits_dev != nullptr && out_idx_dev != nullptr,
+              "the sampling buffer must not be null");
+    GpuArgMax(logits_dev, n, out_idx_dev);
+    return;
+  }
+  RPG_CHECK(counter_dev != nullptr, "the device-side counter must not be null");
+  float* u_dev = UStagingPtr();
+  CounterUniformKernel<<<1, 1, 0, EngineStream()>>>(seed, counter_dev, u_dev);
+  CheckLaunch("CounterUniformKernel");
+  GpuFilterToProbs(logits_dev, n, opt, probs_dev);
+  // ⚠️ 不走 GpuInverseSample（那条路径要把 u 从 host 写回显存，捕获期间非法）——
+  // u 已经在 u_dev 里了，直接启动**同一个** kernel。
+  RPG_CHECK(probs_dev != nullptr && out_idx_dev != nullptr,
+            "the sampling buffer must not be null");
+  InverseSampleKernel<<<1, 1, 0, EngineStream()>>>(probs_dev, n, u_dev, out_idx_dev);
+  CheckLaunch("InverseSampleKernel");
 }
 
 }  // namespace rpg

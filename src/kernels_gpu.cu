@@ -170,8 +170,13 @@ __global__ void RmsNormKernel(const float* x, const float* w, int64_t n,
 
 // ---------------------------------------------------------------- RoPE
 
+// ⚠️ `pos0_dev` 是**设备指针**而不是值参：CUDA Graph 回放时每一个 kernel 参数
+// 都是捕获那一刻的值，值参会让每一步都用同一个位置（RoPE 一直按同一个 pos 转，
+// 症状是"第 1 个 token 对、从第 2 个起胡说"）。多一次全局读换掉那一整类错误。
 __global__ void RopeKernel(float* x, int32_t n_heads, int32_t head_dim,
-                           int32_t half, const float* rope_tab, int64_t pos0) {
+                           int32_t half, const float* rope_tab,
+                           const int64_t* __restrict__ pos0_dev) {
+  const int64_t pos0 = *pos0_dev;
   const int64_t idx = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
   const int64_t per_row = static_cast<int64_t>(n_heads) * half;
   const int64_t row = idx / per_row;
@@ -280,10 +285,12 @@ __global__ void CausalAttentionKernel(const float* q, const float* k,
 // 所以是一次带下标重排的遍历，不是整段拷贝。
 __global__ void KvWriteKernel(const float* __restrict__ k_src,
                               const float* __restrict__ v_src,
-                              int32_t n_kv_heads, int32_t head_dim, int64_t pos0,
+                              int32_t n_kv_heads, int32_t head_dim,
+                              const int64_t* __restrict__ pos0_dev,
                               int64_t max_seq, int64_t total,
                               __half* __restrict__ k_dst,
                               __half* __restrict__ v_dst) {
+  const int64_t pos0 = *pos0_dev;  // 设备指针的理由见 RopeKernel
   const int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
   if (i >= total) return;
   const int64_t d = i % head_dim;
@@ -310,9 +317,11 @@ __global__ void AttentionFromCacheKernel(const float* __restrict__ q,
                                          const __half* __restrict__ v_layer,
                                          int64_t max_seq, int32_t n_heads,
                                          int32_t n_kv_heads, int32_t head_dim,
-                                         float scale, int64_t pos0,
+                                         float scale,
+                                         const int64_t* __restrict__ pos0_dev,
                                          int64_t n_scores,
                                          float* __restrict__ out) {
+  const int64_t pos0 = *pos0_dev;  // 设备指针的理由见 RopeKernel
   const int64_t th = blockIdx.x;
   const int64_t t = th / n_heads;
   const int32_t h = static_cast<int32_t>(th - t * n_heads);
@@ -470,13 +479,29 @@ unsigned GridFor(int64_t n, int threads) {
 
 // ---------------------------------------------------------------- 启动入口
 
+namespace {
+
+// attention 的 scores 缓冲占多少动态共享内存。
+//
+// ⚠️ **两处必须用同一个公式**：一处是"实际启动时传多少"，一处是"要不要抬 48 KiB
+// 上限"。抄成两份就会漂 —— 抬少了启动失败，抬多了白占 occupancy，而两种情况都
+// 只在 n_scores 跨过某个阈值时才出现。GpuCausalAttention（整段，n = seq）与
+// GpuAttentionFromCache（增量，n = pos0 + seq 或 max_seq）都用它。
+size_t AttentionShmemBytes(int64_t n_scores) {
+  const size_t fl =
+      (static_cast<size_t>(n_scores) + 1u) & ~static_cast<size_t>(1u);
+  return (fl + kThreads * 2u) * sizeof(float);
+}
+
+}  // namespace
+
 void GpuDequantRow(uint32_t type, const uint8_t* src_dev, int64_t n_elems,
                    float* dst_dev) {
   const BlockShape bs = ShapeOf(type);
   RPG_CHECK(n_elems % bs.elems == 0, "dequant length %lld is not a multiple of the block size %d",
             static_cast<long long>(n_elems), bs.elems);
-  DequantRowKernel<<<GridFor(n_elems, 256), 256>>>(type, src_dev, n_elems,
-                                                   bs.elems, bs.bytes, dst_dev);
+  DequantRowKernel<<<GridFor(n_elems, 256), 256, 0, EngineStream()>>>(
+      type, src_dev, n_elems, bs.elems, bs.bytes, dst_dev);
   CheckLaunch("DequantRowKernel");
 }
 
@@ -492,7 +517,7 @@ void GpuMatMulQuant(const GpuTensor& w, const float* X_dev, int64_t n_tokens,
             static_cast<long long>(w.rows), static_cast<long long>(w.cols));
   const unsigned gy = GridFor(n_tokens, kTileTokens);
   const dim3 grid(static_cast<unsigned>(w.rows), gy);
-  MatMulQuantKernel<<<grid, kThreads>>>(
+  MatMulQuantKernel<<<grid, kThreads, 0, EngineStream()>>>(
       w.type, static_cast<const uint8_t*>(w.buf.data()), w.rows, w.row_bytes(),
       w.cols, bs.elems, bs.bytes, X_dev, n_tokens, OUT_dev);
   CheckLaunch("MatMulQuantKernel");
@@ -501,8 +526,8 @@ void GpuMatMulQuant(const GpuTensor& w, const float* X_dev, int64_t n_tokens,
 void GpuRmsNorm(const float* x, const float* w, int64_t n_rows, int64_t n,
                 int64_t stride, float eps, float* out) {
   RPG_CHECK(n > 0 && n_rows > 0 && stride >= n, "invalid RmsNorm arguments");
-  RmsNormKernel<<<static_cast<unsigned>(n_rows), kThreads>>>(x, w, n, stride, eps,
-                                                             out);
+  RmsNormKernel<<<static_cast<unsigned>(n_rows), kThreads, 0, EngineStream()>>>(
+      x, w, n, stride, eps, out);
   CheckLaunch("RmsNormKernel");
 }
 
@@ -511,8 +536,11 @@ void GpuRope(float* x, int32_t n_heads, int32_t head_dim, const float* rope_tab,
   const int32_t half = head_dim / 2;
   RPG_CHECK(head_dim % 2 == 0, "head_dim %d must be even (RoPE pairs half-dimensions)", head_dim);
   const int64_t total = n_rows * n_heads * half;
-  RopeKernel<<<GridFor(total, 256), 256>>>(x, n_heads, head_dim, half, rope_tab,
-                                           pos0);
+  // 位置走暂存区：签名不变（tools/kv_map_check.cu 直接调这些算子），地址固定
+  // 才能进 CUDA Graph。见 cuda_common.h 的 pos0 暂存区说明。
+  const int64_t* pos_dev = StagePos0Cached(pos0);
+  RopeKernel<<<GridFor(total, 256), 256, 0, EngineStream()>>>(
+      x, n_heads, head_dim, half, rope_tab, pos_dev);
   CheckLaunch("RopeKernel");
 }
 
@@ -522,8 +550,7 @@ void GpuCausalAttention(const ModelMeta& c, const float* q_dev,
   RPG_CHECK(seq > 0, "attention seq must be positive");
   const float scale = 1.0f / sqrtf(static_cast<float>(c.head_dim));
   // 共享内存 = scores[seq] + 8 字节对齐的 red[kThreads]。
-  const size_t fl = (static_cast<size_t>(seq) + 1u) & ~static_cast<size_t>(1u);
-  const size_t sh_bytes = (fl + kThreads * 2u) * sizeof(float);
+  const size_t sh_bytes = AttentionShmemBytes(seq);
   // 超过默认的 48 KiB 才需要显式申请。seq 到 4096 时是 17 KiB，用不着 ——
   // 但把这行留着，免得将来把 max_seq 调大之后收到一个"启动失败"的谜题。
   if (sh_bytes > 48 * 1024) {
@@ -532,7 +559,8 @@ void GpuCausalAttention(const ModelMeta& c, const float* q_dev,
         static_cast<int>(sh_bytes)));
   }
   const int64_t blocks = seq * c.n_heads;
-  CausalAttentionKernel<<<static_cast<unsigned>(blocks), kThreads, sh_bytes>>>(
+  CausalAttentionKernel<<<static_cast<unsigned>(blocks), kThreads, sh_bytes,
+                          EngineStream()>>>(
       q_dev, k_dev, v_dev, seq, c.n_heads, c.n_kv_heads, c.head_dim, scale,
       out_dev);
   CheckLaunch("CausalAttentionKernel");
@@ -548,8 +576,9 @@ void GpuKvWrite(const float* k_dev, const float* v_dev, int32_t n_kv_heads,
             static_cast<long long>(pos0), static_cast<long long>(pos0 + seq),
             static_cast<long long>(max_seq));
   const int64_t total = seq * n_kv_heads * head_dim;
-  KvWriteKernel<<<GridFor(total, 256), 256>>>(
-      k_dev, v_dev, n_kv_heads, head_dim, pos0, max_seq, total,
+  const int64_t* pos_dev = StagePos0Cached(pos0);
+  KvWriteKernel<<<GridFor(total, 256), 256, 0, EngineStream()>>>(
+      k_dev, v_dev, n_kv_heads, head_dim, pos_dev, max_seq, total,
       reinterpret_cast<__half*>(k_cache_layer),
       reinterpret_cast<__half*>(v_cache_layer));
   CheckLaunch("KvWriteKernel");
@@ -558,48 +587,87 @@ void GpuKvWrite(const float* k_dev, const float* v_dev, int32_t n_kv_heads,
 void GpuAttentionFromCache(const ModelMeta& c, int64_t pos0, const float* q_dev,
                            int64_t seq, const uint16_t* k_layer,
                            const uint16_t* v_layer, int64_t max_seq,
-                           float* out_dev) {
+                           float* out_dev, int64_t sh_positions) {
   RPG_CHECK(seq > 0, "attention seq must be positive");
   RPG_CHECK(pos0 >= 0, "pos0 must not be negative");
   const float scale = 1.0f / sqrtf(static_cast<float>(c.head_dim));
-  // scores 按**绝对位置数** n_scores = pos0 + seq 备（见 kernel 里的说明）。
-  const int64_t n_scores = pos0 + seq;
-  const size_t fl =
-      (static_cast<size_t>(n_scores) + 1u) & ~static_cast<size_t>(1u);
-  const size_t sh_bytes = (fl + kThreads * 2u) * sizeof(float);
+  // scores 按**绝对位置数**备（见 kernel 里的说明）。
+  //
+  // ⚠️ 默认口径 `pos0 + seq` 从 P2 起就在用，逐字不变。但 CUDA Graph 下
+  // **shared memory 大小是启动参数、会被录进图**，而回放时 pos0 每步递增 ——
+  // 照捕获那一刻的 pos0 备，第 2 步起就越界写。所以图路径显式传
+  // `sh_positions = kv->max_seq()`，一次备够"最大可能用到的位置数"。
+  // 代价是 occupancy 下降，所以**只让图路径付这个代价**：prefill 保持原样
+  //（prefill 要的正是"别拖慢"，P4 的目标里有 prefill ≥ 1000 tok/s）。
+  const int64_t n_scores = sh_positions > 0 ? sh_positions : (pos0 + seq);
+  RPG_CHECK(n_scores >= pos0 + seq,
+            "shared-memory budget (" RPG_SZ ") is smaller than the positions this "
+            "call needs (" RPG_SZ ")",
+            RPG_SZ_ARG(n_scores), RPG_SZ_ARG(pos0 + seq));
+  const size_t sh_bytes = AttentionShmemBytes(n_scores);
   // 默认上限 48 KiB：n_scores 到 6144（RPGBar 的上下文上限）时是 6144 + 256 =
   // 6400 个 float = 25.6 KiB，够用。留这段是为了将来把 max_seq 调更大时，
   // 收到的是一条明确的启动失败，而不是一个"kernel 莫名返回错误"的谜题。
+  //
+  // ⚠️ **捕获期间 cudaFuncSetAttribute 是非法 API**（它要动函数的属性，图里没有
+  // 这种节点）。所以捕获中遇到"需要抬上限"就直接报错说清楚 —— 而不是让
+  // cudaStreamEndCapture 返回一个看不出根因的 cudaErrorStreamCaptureUnsupported。
+  // 图路径的正确做法是**在 BeginCapture 之前**调 GpuAttentionWarmupShmem
+  //（CaptureDecodeStep 就是那么做的）。
   if (sh_bytes > 48 * 1024) {
+    RPG_CHECK(!StreamIsCapturing(),
+              "this attention call needs " RPG_SZ " bytes of dynamic shared memory, "
+              "which requires cudaFuncSetAttribute -- illegal inside a CUDA Graph "
+              "capture. Call GpuAttentionWarmupShmem(max_seq) before capturing, "
+              "lower max_seq, or turn the graph path off.",
+              RPG_SZ_ARG(sh_bytes));
     RPG_CUDA_CHECK(cudaFuncSetAttribute(
         AttentionFromCacheKernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(sh_bytes)));
   }
   const int64_t blocks = seq * c.n_heads;
-  AttentionFromCacheKernel<<<static_cast<unsigned>(blocks), kThreads, sh_bytes>>>(
+  const int64_t* pos_dev = StagePos0Cached(pos0);
+  AttentionFromCacheKernel<<<static_cast<unsigned>(blocks), kThreads, sh_bytes,
+                             EngineStream()>>>(
       q_dev, reinterpret_cast<const __half*>(k_layer),
       reinterpret_cast<const __half*>(v_layer), max_seq, c.n_heads,
-      c.n_kv_heads, c.head_dim, scale, pos0, n_scores, out_dev);
+      c.n_kv_heads, c.head_dim, scale, pos_dev, n_scores, out_dev);
   CheckLaunch("AttentionFromCacheKernel");
+}
+
+void GpuAttentionWarmupShmem(int64_t sh_positions) {
+  RPG_CHECK(sh_positions > 0, "sh_positions must be positive (got %lld)",
+            static_cast<long long>(sh_positions));
+  const size_t sh_bytes = AttentionShmemBytes(sh_positions);
+  // 48 KiB 以下本来就能启动，不必动函数属性 —— 少一次 API 调用，也少一个
+  // "明明没超还去改全局上限"的副作用。
+  if (sh_bytes <= 48 * 1024) return;
+  // 这里**故意**用与 GpuAttentionFromCache 里同一个断言：万一哪天真被放在捕获
+  // 窗口里调用，得到的是一条说得清的错误，而不是一个悬空的函数属性改动。
+  RPG_CHECK(!StreamIsCapturing(),
+            "GpuAttentionWarmupShmem must be called before cudaStreamBeginCapture");
+  RPG_CUDA_CHECK(cudaFuncSetAttribute(
+      AttentionFromCacheKernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(sh_bytes)));
 }
 
 void GpuArgMax(const float* x_dev, int64_t n, int32_t* out_idx_dev) {
   RPG_CHECK(n > 0, "argmax length must be positive");
   RPG_CHECK(n <= 0x7FFFFFFF, "argmax index exceeds int32 (%lld)",
             static_cast<long long>(n));
-  ArgMaxKernel<<<1, kArgMaxThreads>>>(x_dev, n, out_idx_dev);
+  ArgMaxKernel<<<1, kArgMaxThreads, 0, EngineStream()>>>(x_dev, n, out_idx_dev);
   CheckLaunch("ArgMaxKernel");
 }
 
 void GpuSiluMulInPlace(float* gate_dev, const float* up_dev, int64_t n) {
   if (n <= 0) return;
-  SiluMulKernel<<<GridFor(n, 256), 256>>>(gate_dev, up_dev, n);
+  SiluMulKernel<<<GridFor(n, 256), 256, 0, EngineStream()>>>(gate_dev, up_dev, n);
   CheckLaunch("SiluMulKernel");
 }
 
 void GpuVecAddInPlace(float* a_dev, const float* b_dev, int64_t n) {
   if (n <= 0) return;
-  VecAddKernel<<<GridFor(n, 256), 256>>>(a_dev, b_dev, n);
+  VecAddKernel<<<GridFor(n, 256), 256, 0, EngineStream()>>>(a_dev, b_dev, n);
   CheckLaunch("VecAddKernel");
 }
 
@@ -609,7 +677,7 @@ void GpuEmbeddingLookup(const GpuTensor& emb, const int32_t* toks_dev, int64_t s
   RPG_CHECK(emb.cols % bs.elems == 0, "embedding width %lld is not a multiple of the block size",
             static_cast<long long>(emb.cols));
   const int64_t n = seq * emb.cols;
-  EmbeddingLookupKernel<<<GridFor(n, 256), 256>>>(
+  EmbeddingLookupKernel<<<GridFor(n, 256), 256, 0, EngineStream()>>>(
       emb.type, static_cast<const uint8_t*>(emb.buf.data()), emb.cols,
       emb.row_bytes(), bs.elems, bs.bytes, toks_dev, seq, x_dev);
   CheckLaunch("EmbeddingLookupKernel");

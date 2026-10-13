@@ -60,6 +60,18 @@ namespace rpg {
 // 这一次 launch ⇒ 那一整类越界在这里不可达。
 class GpuScratch {
  public:
+  // ⚠️ 显式析构：`graph_exec` 要 cudaGraphExecDestroy 掉。不交给"进程退出时的
+  // 静态析构"—— 那时 CUDA 上下文可能已经销毁（DESIGN §9.6 那个坑）；而且图是
+  // **每个会话一份**，会话释放时正该销毁。
+  GpuScratch() = default;
+  ~GpuScratch();
+  GpuScratch(const GpuScratch&) = delete;
+  GpuScratch& operator=(const GpuScratch&) = delete;
+  // 也不给 move：move 之后源对象的析构会把已经转手的图句柄 destroy 掉。
+  // 会话是用独占指针持有的，用不上 move。
+  GpuScratch(GpuScratch&&) = delete;
+  GpuScratch& operator=(GpuScratch&&) = delete;
+
   void Ensure(const ModelMeta& c, int64_t seq);
 
   int64_t bytes() const;
@@ -84,6 +96,16 @@ class GpuScratch {
   // 的 DeviceBuffer 来缓存它 —— 那种静态对象要到进程退出才析构，那时 CUDA
   // 上下文可能已经销毁（RPGBarEngine 的"退出挂起"就是这么来的）。
   DeviceBuffer argmax_idx;
+
+  // ---- CUDA Graph（P4）----
+  // 录好的"单步 decode"（采样 → 前向）。**每个会话一份**：图里含 KV Cache 的
+  // 层基址与这块 scratch 的地址，全是会话私有的 ⇒ 图不能跨会话复用。
+  // nullptr = 还没录（或图路径被关掉）。
+  cudaGraphExec_t graph_exec = nullptr;
+  // 录制时的"形状指纹"（模型指针 + 层数/hidden/vocab + KV 容量）。与当前请求
+  // 不符就重录 —— 防的是"同一个 scratch 被换上另一个模型或另一个容量的 cache"：
+  // 当前调用方不会这么做，但静默出错的代价太大（图会照旧回放，只是算错）。
+  uint64_t graph_key = 0;
 };
 
 struct GpuForwardOptions {
@@ -120,6 +142,12 @@ void GpuForwardFull(const GpuModel& m, const int32_t* tokens, int64_t seq,
 void GpuForwardStep(const GpuModel& m, int32_t token, int64_t pos, GpuKvCache* kv,
                     GpuScratch* s, std::vector<float>* logits);
 
+// 单 token 增量前向的**设备 token** 版本：token 已经在显存里（图路径里它就是
+// 上一步采样的落点），不经过 host。语义与 GpuForwardStep 完全一致 —— 它俩不是
+// "两份实现"，而是同一个核心在"token 从哪来"上的两个入口。
+void GpuForwardStepDev(const GpuModel& m, const int32_t* token_dev, int64_t pos,
+                       GpuKvCache* kv, GpuScratch* s);
+
 // ---------------------------------------------------------------- 生成
 
 struct GpuGenerateOptions {
@@ -139,6 +167,11 @@ struct GpuGenerateOptions {
   // nullptr**，此时 decode 循环里一次 607 KB 的搬运都没有；对拍工具才需要它
   // （用来在分歧处打印两边的 top-5 与两个 token 的 logit 差，DESIGN §7.3）。
   std::vector<float>* step_logits = nullptr;
+  // 走 CUDA Graph 路径（P4）。默认 **false** ⇒ P0–P3 的行为逐字不变 —— 这是
+  // 刻意的：先让"图路径的输出 == 老路径的输出"在判据里站住，再谈要不要设默认。
+  // ⚠️ 与 step_logits 互斥（后者要每步把 logits 拷回 host，图里做不到）：
+  // 同时打开时**按老路径走**并放弃图 —— 而不是悄悄给出一份没有 step_logits 的结果。
+  bool use_graph = false;
 };
 
 // 生成。first_logits_dev 是"下一个 token"的分布所在的**显存**地址
