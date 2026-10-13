@@ -1,4 +1,4 @@
-/* engine.cc —— C ABI 的实现（P0：骨架 + 模型元数据）。
+/* engine.cc —— C ABI 的实现（P0 骨架 → P1/P2 前向与 KV → **P3 接入**）。
  *
  * 这里是引擎与宿主的唯一交界面。三条贯穿全文件的约定（与 CPU 版逐条对齐）：
  *
@@ -12,12 +12,28 @@
  *    再调用时一定失败（而不是像复用的 fd 那样打到另一个对象上，那种错最难查）。
  *
  * 3. **本层不做业务判断**。工具允不允许、参数合不合法、状态怎么改，全在宿主
- *    （对齐项目里"护栏做在工具体里"那条纪律）。
+ *    （对齐项目里"护栏做在工具体里"那条纪律）。这里只做：解析请求 → 渲染 →
+ *    分词 → 前向/生成 → 解析输出 → 拼响应。
  *
- * 当前阶段（P0）能做到的事：加载 GGUF、读元数据、开关会话、报出设备信息。
- * **`generate` 还没有实现** —— 它会明确报错，而不是返回一段假文本。
- * 这是刻意的：一个"看起来能用但输出是垃圾"的引擎，比一个"明确说没实现"的
- * 引擎危险得多。阶段划分见 docs/DESIGN.md §5。
+ * ## P3：generate 真的实现了
+ *
+ * P0 时代这个文件里那句"**`generate` 还没有实现** —— 它会明确报错，而不是返回
+ * 一段假文本"**已经不成立**：既然整网前向（P1）、fp16 KV Cache 与增量解码（P2）、
+ * 设备端采样（P3 第一/二步）都各自有判据且全绿，接进 ABI 就是把它们缝起来。
+ *
+ * 现在的分工是：
+ *   load_model     —— 读元数据 + **权重上卡**（1.03 GiB，量化字节原样上传）
+ *   session_create —— 分配该会话的 KV Cache（4096 长度 @1.7B 是 448 MiB）
+ *   generate       —— 渲染 ChatML → 分词 → **与 cached_ids 对最长公共前缀** →
+ *                     只对新增部分做前向 → 采样生成 → 解码 → 解析 → 拼响应
+ *
+ * 与 CPU 版 `src/engine.cc` 是**逐条对齐**的：同样的九步、同样的不变量
+ * （cache 长度 == prompt + 生成数；失败检查全部前置；logits 不做 host 往返）。
+ * 差异只在"算在哪"：CPU 版把 logits 下载回 host 再取最后一行，这里**整个 decode
+ * 循环一次 607 KB 的搬运都没有** —— `GpuGenerate` 直接吃显存里的那一行。
+ *
+ * 解码**不加 skip_special**：`<tool_call>` / `</tool_call>` / `<think>` 自己就是
+ * 特殊 token，跳过它们会把结构标记一起删掉（CPU 版 DESIGN §16.4）。
  */
 
 #include "rpg_engine.h"
@@ -30,11 +46,25 @@
 #include <unordered_map>
 #include <vector>
 
+#include "chat_template.h"
 #include "common.h"
 #include "cuda_common.h"
 #include "gguf.h"
 #include "json.h"
 #include "model_meta.h"
+#include "tool_parser.h"
+#include "tokenizer.h"
+
+// 显存侧的组件只在这三种构建里有定义（它们的头文件整体被 #ifdef 包住）。
+#ifdef RPG_HAS_CUDA
+#include "gpu_model.h"
+#include "kv_cache_gpu.h"
+#include "qwen3_gpu.h"
+// SampleOptions 的语义是**契约**（同源副本 sampler.h）—— qwen3_gpu.h 已经把它
+// 带进来了，这里再写一次是为了让"engine.cc 直接用到 SampleOptions"在 include
+// 列表里看得见。⚠️ 必须在 namespace 之外：sampler.h 自带 `namespace rpg`。
+#include "sampler.h"
+#endif
 
 namespace {
 
@@ -43,6 +73,8 @@ constexpr const char* kEngineVersion = "0.1.0";
 
 // 请求/会话配置里没给 max_tokens 时的默认值（与 CPU 版一致）。
 constexpr int32_t kDefaultMaxTokens = 256;
+// KV Cache 里给停止标记与端点检查留的余量（与 CPU 版同值）。
+constexpr int64_t kSeqMargin = 4;
 
 // 采样默认（与 CPU 版一致：top_k 关、top_p 0.95）。
 constexpr int32_t kDefaultTopK = 0;
@@ -54,10 +86,22 @@ constexpr float kMaxTemperature = 2.0f;
 struct Session {
   int32_t model = -1;
 
-  // P1/P2：前向与增量解码都已经实现并对拍过（逐层走 tools/layer_check、
-  // 逐 token 走 tools/gen_check），但**验证都走命令行工具** —— ABI 侧还没有
-  // 挂上任何显存状态。P3 把 GpuModel / GpuKvCache 接进会话之后，这里才会有
-  // 显存句柄；在那之前 reset 保持空操作（不假装清了个东西）。
+#ifdef RPG_HAS_CUDA
+  // 会话的显存状态。KV Cache 是一份会话最大的显存占用（4096 长度 @1.7B 是
+  // 448 MiB），所以它跟着会话走、会话销毁即释放；`scratch` 只增不减，同一
+  // 会话反复生成时白捡（见 GpuScratch 的头注释）。
+  //
+  // 两者都**只在 CUDA 构建里存在**：没有 nvcc 的构建要能照常编译、照常读
+  // 元数据（P0 就定下的"CI 里跑得起来"），那种构建下 generate 会明确报错。
+  std::unique_ptr<rpg::GpuKvCache> kv;
+  rpg::GpuScratch scratch;
+#endif
+
+  // **cache 里当前实际存着的 token 序列**。generate 靠它做最长公共前缀匹配：
+  // 只有长度与内容都逐一对上才能复用前缀。这里和 `kv->len()` 必须始终相等，
+  // 不一致意味着"复用了错误的 K/V"—— 那种错不崩，只让输出悄悄变味。
+  std::vector<int32_t> cached_ids;
+
   int32_t max_tokens = kDefaultMaxTokens;
   std::vector<std::string> stop;
   float temperature = 0.0f;
@@ -75,6 +119,16 @@ struct ModelEntry {
   // RoPE 表覆盖的位置数（已按 context_length 截过）、新建会话的 KV 容量。
   int32_t max_pos = 0;
   int32_t default_max_seq = 0;
+
+#ifdef RPG_HAS_CUDA
+  // 权重上卡（P3）。与 CPU 版最大的差别在这一行：那边 `Model` 里的
+  // QuantMatrix 是**指向 mmap 的视图**（零拷贝），所以 load 只要几毫秒；
+  // 这里必须把 1.03 GiB 量化字节真的搬进显存，load 变成"几秒"量级。
+  //
+  // 设备不可用时它是 nullptr（只读到元数据），此时建会话会明确报错而不是
+  // 悄悄退化 —— 见 session_create。
+  std::unique_ptr<rpg::GpuModel> gpu;
+#endif
 
   std::vector<int32_t> sessions;  // 便于 unload 时级联销毁
 };
@@ -131,6 +185,39 @@ rpg::Json ParseConfigOrEmpty(const char* text, const char* what) {
   return j;
 }
 
+// 停止 token 的来源有三处：模型自带 eos、`<|im_end|>`、以及请求/会话里给的
+// 停止串。后两者里的字符串必须先变成 token id —— 引擎按 token 粒度停，
+// 不做「回看最近 N 个 token 的文本匹配」，那是宿主的事（与 CPU 版逐字同义）。
+void AppendStopString(const rpg::Tokenizer& tok, const std::string& s,
+                      std::vector<int32_t>* out) {
+  if (s.empty()) return;
+  const int32_t direct = tok.IdOf(s);
+  if (direct >= 0) {
+    out->push_back(direct);
+    return;
+  }
+  const std::vector<int32_t> ids = tok.Encode(s, /*parse_special=*/false);
+  if (ids.size() == 1) {
+    out->push_back(ids[0]);
+    return;
+  }
+  RPG_LOG_WARN("停止串「%s」不是单个 token（编成 " RPG_SZ
+               " 个），已忽略 —— 多 token 的停止串需要文本级回看，属宿主职责",
+               s.c_str(), RPG_SZ_ARG(ids.size()));
+}
+
+void AppendStopStrings(const rpg::Tokenizer& tok, const rpg::Json& arr,
+                       std::vector<int32_t>* out) {
+  if (!arr.IsArray()) return;
+  for (const rpg::Json& e : arr.elements()) {
+    if (e.IsString()) AppendStopString(tok, e.AsString(), out);
+  }
+}
+
+bool ContainsId(const std::vector<int32_t>& v, int32_t id) {
+  return std::find(v.begin(), v.end(), id) != v.end();
+}
+
 }  // namespace
 
 // ABI 边界的统一收口：把异常翻成"调用方看得懂的返回码"。
@@ -180,17 +267,28 @@ int32_t rpg_engine_load_model(const char* model_path, const char* config_json) {
     entry->max_pos = ctx;
     entry->default_max_seq = ctx;
 
-    RPG_LOG_INFO("已加载 %s（%d 层 / hidden %d / %d 头 / %d KV 头 / 词表 %d / "
-                 "位置 %d）—— 只读元数据，权重未上传显存（上卡在 P3 接进 ABI）",
+    // 顺序是有意的：先把形状打出来（快），再上卡（几秒），日志里能看出卡在哪一步。
+    RPG_LOG_INFO("已加载 %s（%d 层 / hidden %d / %d 头 / %d KV 头 / 词表 %d / 位置 %d）",
                  mm.name.c_str(), mm.n_layers, mm.hidden, mm.n_heads,
                  mm.n_kv_heads, mm.vocab, entry->max_pos);
 
+#ifdef RPG_HAS_CUDA
+    // 权重上卡（P3）。设备**完全不可用**时降级成"只读元数据" —— P0 就定下的那条
+    // （CI 与没 GPU 的机器要能 load 起来、能读 model_info）。但设备可用而上传失败
+    // （显存不足、未知量化类型……）**必须抛**：那是真错误，静默降级会让宿主以为
+    // "加载成功了"，然后在 generate 时收到一条完全看不懂的报错。
     const rpg::DeviceInfo dev = rpg::QueryDevice(0);
     if (!dev.available) {
-      // 这一条是**警告不是错误**：P0 允许在没 GPU 的机器上加载元数据（CI 里跑
-      // 得起来），只是不能生成。真正的失败发生在 generate。
-      RPG_LOG_WARN("没有可用的 CUDA 设备：%s", dev.reason.c_str());
+      RPG_LOG_WARN("没有可用的 CUDA 设备：%s —— 只读到元数据，建会话与生成会失败",
+                   dev.reason.c_str());
+    } else {
+      entry->gpu = std::make_unique<rpg::GpuModel>(
+          rpg::GpuModel::Load(model_path, entry->max_pos));
+      RPG_LOG_INFO("权重已上卡：%s", entry->gpu->Describe().c_str());
     }
+#else
+    RPG_LOG_INFO("本次构建没有 CUDA 后端：只读元数据，generate 会明确报错。");
+#endif
 
     std::lock_guard<std::mutex> lk(g_mutex);
     const int32_t h = g_next_model++;
@@ -233,6 +331,24 @@ int32_t rpg_engine_session_create(int32_t model, const char* session_json) {
       const int64_t v = cfg["max_tokens"].AsInt(kDefaultMaxTokens);
       s->max_tokens = static_cast<int32_t>(v > 0 ? v : kDefaultMaxTokens);
     }
+    // 缓存里至少得留一个位置给生成结果，否则这个会话永远产不出东西。
+    // **收窄而不是报错**：max_tokens 偏小是配置问题，不该让会话建不出来
+    // （与 CPU 版同一条，连收窄到什么值都一样）。
+    if (s->max_tokens >= s->max_seq) {
+      RPG_LOG_WARN("会话 max_tokens=%d 相对 max_seq=%d 过大，已收到 %d",
+                   s->max_tokens, s->max_seq, s->max_seq - 1);
+      s->max_tokens = s->max_seq - 1;
+    }
+
+#ifdef RPG_HAS_CUDA
+    // KV Cache 在这里就分配、**不**延迟到第一次 generate：显存不够要在建会话时
+    // 报出来（那时宿主还能选一个小一点的 max_seq），而不是生成到第 3000 个 token
+    // 时炸在某个 kernel 里（GpuKvCache 头注释里那条理由）。
+    RPG_CHECK(m->gpu != nullptr,
+              "这个模型加载时没有可用的 CUDA 设备（当时只读了元数据），无法建会话 —— "
+              "确认机器上有能用的 NVIDIA 卡，且产物是 CUDA 版");
+    s->kv = std::make_unique<rpg::GpuKvCache>(m->meta, s->max_seq);
+#endif
     if (cfg.Has("temperature")) {
       float t = static_cast<float>(cfg["temperature"].AsDouble(0.0));
       if (t > kMaxTemperature) {
@@ -255,7 +371,15 @@ int32_t rpg_engine_session_create(int32_t model, const char* session_json) {
       }
     }
 
+#ifdef RPG_HAS_CUDA
+    // K+V 各 fp16 ⇒ 每个元素 4 字节（CPU 版这里写 8，因为那边是 fp32）。
+    RPG_LOG_INFO("已创建会话（模型 #%d，缓存容量 %d，KV 约 %.0f MiB）", model,
+                 s->max_seq,
+                 static_cast<double>(s->max_seq) * m->meta.n_layers *
+                     m->meta.n_kv_heads * m->meta.head_dim * 4 / 1048576.0);
+#else
     RPG_LOG_INFO("已创建会话（模型 #%d，缓存容量 %d）", model, s->max_seq);
+#endif
 
     std::lock_guard<std::mutex> lk(g_mutex);
     const int32_t h = g_next_session++;
@@ -289,8 +413,14 @@ int32_t rpg_engine_session_reset(int32_t session) {
   try {
     rpg::SetLastError("");
     Session* s = RequireSession(session);  // 不存在即抛 → 返回负值
-    (void)s;
-    // 会话还没有 KV 状态，reset 是空操作。P3 起这里清显存里的 KV 与 token 历史。
+#ifdef RPG_HAS_CUDA
+    // Reset 只把长度归零、**显存留着** —— 同一房间开新一局时不必重新分配那几百
+    // MiB（与 CPU 版同一条）。cached_ids 必须跟着清：它是"cache 里存着什么"的
+    // 唯一记录，漏清会让下一次 generate 拿一个与 cache 对不上的前缀去做匹配
+    // —— 那种错不崩，只让输出悄悄变味。
+    if (s->kv != nullptr) s->kv->Reset();
+#endif
+    s->cached_ids.clear();
     return RPG_ENGINE_OK;
   }
   RPG_ABI_CATCH(-1)
@@ -300,27 +430,186 @@ char* rpg_engine_generate(int32_t session, const char* request_json) {
   try {
     rpg::SetLastError("");
     Session* s = RequireSession(session);
-    (void)s;
-    (void)request_json;
-    // ABI 到这里为止。**明确报错，不返回假文本。**
+    ModelEntry* m = RequireModel(s->model);
+
 #ifdef RPG_HAS_CUDA
-    // P2 已经把整网前向 + KV Cache + 增量解码做出来、并逐 token 对拍过
-    // （tools/gen_check 与 tests/run_p2.sh）。但那些验证**都走命令行工具**：
-    // session 级的显存状态（GpuModel / GpuKvCache 的句柄）要到 P3 才挂上来。
-    // 报错文案必须把这个区别说清 —— 否则宿主会以为是"没 GPU / 没编 CUDA"，
-    // 去查错方向。
-    rpg::Throw(
-        "CUDA 后端的生成还没接进 ABI（P2 已完成整网前向 + KV Cache + 增量解码，"
-        "逐层与逐 token 对拍都过 —— 见 tools/gen_check 与 tests/run_p2.sh；"
-        "把显存状态挂进 session 是 P3 的事）。"
-        "当前产物编入了 CUDA 支持，但 rpg_engine_generate 还是空的，"
-        "请暂时用 RPGBarEngine 的 CPU 版。");
+    // 两个"不该发生但要说清"的前置检查：设备不可用时 load_model 只读了元数据
+    // （见那边），这种模型不该走到生成。
+    RPG_CHECK(m->gpu != nullptr,
+              "模型加载时没有可用的 CUDA 设备（当时只读了元数据），无法生成");
+    RPG_CHECK(s->kv != nullptr,
+              "会话没有 KV Cache —— 不该发生（建会话时会分配），请报 bug");
+    const rpg::GpuModel& model = *m->gpu;
+    const rpg::ModelMeta& c = model.config();
+    const rpg::Tokenizer& tok = model.tokenizer();
+
+    // ---------------------------------------------------------- 1. 解析请求
+    RPG_CHECK(request_json != nullptr && *request_json != '\0', "request_json 为空");
+    std::string perr;
+    const rpg::Json req = rpg::Json::Parse(request_json, &perr);
+    RPG_CHECK(perr.empty(), "request_json 解析失败：%s", perr.c_str());
+    RPG_CHECK(req.IsObject(), "request_json 必须是 JSON 对象");
+
+    const std::vector<rpg::ChatMessage> msgs =
+        rpg::ParseMessages(req.Get("messages"));
+    RPG_CHECK(!msgs.empty(), "messages 为空：至少需要一条消息");
+    // 工具列表为空数组时，渲染走的是"无工具"分支（与官方模板一致）。
+    const rpg::Json tools = rpg::ParseTools(req.Get("tools"));
+
+    // ---------------------------------------------------------- 2. 渲染 + 分词
+    rpg::ChatTemplateOptions topt;
+    topt.add_generation_prompt = true;
+    // 缺省 = 思考模式（官方模板只在显式 false 时补空思考块）。
+    topt.enable_thinking = req.Get("enable_thinking").AsBool(true);
+
+    const std::string prompt = rpg::RenderChatml(msgs, tools, topt);
+    std::vector<int32_t> ids = tok.Encode(prompt, /*parse_special=*/true);
+    if (c.add_bos && c.bos_id >= 0) ids.insert(ids.begin(), c.bos_id);
+    const int64_t total = static_cast<int64_t>(ids.size());
+    RPG_CHECK(total > 0, "渲染后的 prompt 编码为空");
+
+    // ---------------------------------------------------------- 3. 与缓存对前缀
+    // 宿主每轮把**完整 messages** 传进来，所以本轮 prompt 通常是"上轮 prompt
+    // + 新回复 + 新消息"。找出公共前缀，只对新增的部分做前向。
+    int64_t lcp = 0;
+    const int64_t cached = static_cast<int64_t>(s->cached_ids.size());
+    RPG_CHECK(cached == s->kv->len(),
+              "内部状态不一致：cached_ids=" RPG_SZ " 而 kv.len=" RPG_SZ,
+              RPG_SZ_ARG(cached), RPG_SZ_ARG(s->kv->len()));
+    while (lcp < cached && lcp < total && s->cached_ids[lcp] == ids[lcp]) ++lcp;
+
+    // 至少要前向一个位置，才有"下一个 token 的分布"可用 —— 全前缀命中（宿主
+    // 原样重发同一份请求）时回退一个位置重算那一个 token。这里刻意不缓存上次
+    // 的 logits 行：多存一份状态就多一处要同步的地方，而代价只是重算一个位置。
+    if (lcp == total) lcp = total - 1;
+    const int64_t rows = total - lcp;  // 本次要前向的位置数（≥ 1）
+
+    // ---------------------------------------------------------- 4. 生成长度与容量
+    int32_t max_tokens = req.Get("max_tokens").AsInt32(s->max_tokens);
+    if (max_tokens <= 0) max_tokens = s->max_tokens;
+
+    // 采样参数：请求优先，其次会话默认（temperature <= 0 = 贪心）。温度钳到
+    // [0, 上限] —— 旋钮拧到底也不会把模型推进"胡言乱语区"。
+    float temperature = req.Get("temperature").AsFloat(s->temperature);
+    if (temperature < 0.0f) temperature = 0.0f;
+    if (temperature > kMaxTemperature) {
+      RPG_LOG_WARN("temperature=%.3f 超过上限 %.1f，已钳制", temperature,
+                   kMaxTemperature);
+      temperature = kMaxTemperature;
+    }
+    const uint64_t seed = static_cast<uint64_t>(
+        req.Get("seed").AsInt(static_cast<int64_t>(s->seed)));
+
+    // **所有会失败的条件检查都在这里做完**，之后才动 cache —— 否则一次失败会
+    // 把会话留在"cached_ids 与 kv.len 对不上"的状态里，下一次调用直接报内部
+    // 状态不一致（这个顺序是 CPU 版 M4 第一次跑红时定下来的）。
+    RPG_CHECK(total + max_tokens + kSeqMargin <= s->kv->max_seq(),
+              "序列超长：prompt " RPG_SZ " + 生成 %d + 余量 " RPG_SZ
+              " 超过会话容量 " RPG_SZ "（调大 session_json.max_seq，或先 session_reset）",
+              RPG_SZ_ARG(total), max_tokens, RPG_SZ_ARG(kSeqMargin),
+              RPG_SZ_ARG(s->kv->max_seq()));
+
+    // ---------------------------------------------------------- 5. prefill
+    if (lcp < s->kv->len()) {
+      // 回退到 lcp：kv 里 [0, lcp) 的 K/V 内容仍然有效（同一位置的 K/V 只由它
+      // 自己的前缀决定），所以归零长度再设回 lcp 即可，不必重算前缀。
+      s->kv->Reset();
+    }
+    s->kv->SetLen(lcp);
+
+    try {
+      // ⚠️ logits 传 **nullptr**：这一段前向的结果只要留在显存里 ——
+      // `s->scratch.logits` 的最后一行就是"下一个 token 的分布"。CPU 版必须把
+      // rows × vocab 的 logits 下载回 host 再取那一行；在 CUDA 侧那一整块搬运
+      // 根本不需要（GpuGenerate 直接吃显存地址）。这是两边**唯一**的实质差异。
+      rpg::GpuForwardFull(model, ids.data() + lcp, rows, &s->scratch,
+                          /*logits=*/nullptr, rpg::GpuForwardOptions(), s->kv.get());
+      RPG_CHECK(s->kv->len() == total,
+                "prefill 后 kv.len=" RPG_SZ "，应为 " RPG_SZ,
+                RPG_SZ_ARG(s->kv->len()), RPG_SZ_ARG(total));
+      s->cached_ids.assign(ids.begin(), ids.end());
+    } catch (...) {
+      // 前向中途失败（OOM、越界……）会把 cache 留在一个"说不清长度"的状态。
+      // 宁可从零重来，也不能让下一次调用拿着错的 cached_ids 去复用前缀。
+      s->kv->Reset();
+      s->cached_ids.clear();
+      throw;
+    }
+
+    // ---------------------------------------------------------- 6. 停止 token
+    std::vector<int32_t> stop_ids;
+    if (c.eos_id >= 0) stop_ids.push_back(c.eos_id);
+    const int32_t im_end = tok.IdOf("<|im_end|>");
+    if (im_end >= 0 && !ContainsId(stop_ids, im_end)) stop_ids.push_back(im_end);
+    AppendStopStrings(tok, req.Get("stop"), &stop_ids);
+    for (const std::string& sp : s->stop) AppendStopString(tok, sp, &stop_ids);
+
+    // ---------------------------------------------------------- 7. 生成
+    rpg::GpuGenerateOptions gopt;
+    gopt.max_tokens = max_tokens;
+    gopt.stop_ids = stop_ids;
+    gopt.sample.temperature = temperature;
+    gopt.sample.top_k = kDefaultTopK;
+    gopt.sample.top_p = kDefaultTopP;
+    gopt.seed = seed;
+
+    std::vector<int32_t> gen;
+    // prefill 的最后一行的**显存地址**。offset 用本次的 rows（GpuForwardFull 内部
+    // 按本次 seq 写 logits），不是 scratch 的容量。
+    const float* last =
+        static_cast<const float*>(s->scratch.logits.data()) + (rows - 1) * c.vocab;
+    rpg::GpuGenerate(model, s->kv.get(), &s->scratch, last, gopt, &gen);
+    s->cached_ids.insert(s->cached_ids.end(), gen.begin(), gen.end());
+
+    // ---------------------------------------------------------- 8. 解码 + 解析
+    // **不加 skip_special**：`<tool_call>` / `</tool_call>` 自己就是特殊 token，
+    // 跳过它们会把结构标记一起删掉（见文件头）。控制标记由解析器清。
+    const std::string raw = tok.Decode(gen, /*skip_special=*/false);
+    const rpg::ParsedOutput parsed = rpg::ParseModelOutput(raw);
+
+    // ---------------------------------------------------------- 9. 拼响应
+    std::string finish;
+    if (!parsed.tool_calls.empty()) {
+      finish = "tool_calls";
+    } else if (parsed.unterminated_tool_call || parsed.unterminated_think) {
+      // 被 max_tokens 截断在半截结构里：宿主据此决定重试还是当失败。
+      finish = "length";
+    } else if (static_cast<int32_t>(gen.size()) >= max_tokens &&
+               (gen.empty() || !ContainsId(stop_ids, gen.back()))) {
+      finish = "length";
+    } else {
+      finish = "stop";
+    }
+
+    rpg::Json resp = rpg::Json::Object();
+    resp.Set("text", parsed.text);
+
+    rpg::Json calls = rpg::Json::Array();
+    for (const rpg::ParsedToolCall& pc : parsed.tool_calls) {
+      rpg::Json one = rpg::Json::Object();
+      one.Set("name", pc.name);
+      // 参数不是合法对象时留 null —— 引擎只解析、不判断合法性（parsed.ok 的语义）。
+      one.Set("arguments", pc.ok ? pc.arguments : rpg::Json());
+      calls.PushBack(std::move(one));
+    }
+    resp.Set("tool_calls", std::move(calls));
+    resp.Set("finish_reason", finish);
+
+    rpg::Json usage = rpg::Json::Object();
+    usage.Set("prompt_tokens", total);
+    usage.Set("completion_tokens", static_cast<int64_t>(gen.size()));
+    resp.Set("usage", std::move(usage));
+
+    return DupForAbi(JsonToAbiString(resp));
 #else
+    (void)s;
+    (void)m;
+    // 没编 CUDA 的产物：明确报错，不给假文本。
     rpg::Throw(
         "本产物**未编译 CUDA 后端**（构建时没检测到 nvcc），因此没有前向实现。"
         "请先装 CUDA Toolkit（≥12.8，sm_120 需要），或改用 RPGBarEngine 的 CPU 版。");
-#endif
     return nullptr;  // 不会到达（rpg::Throw 是 noreturn）
+#endif
   }
   RPG_ABI_CATCH(nullptr)
 }
@@ -359,8 +648,16 @@ char* rpg_engine_model_info(int32_t model) {
     o.Set("default_max_seq", static_cast<int64_t>(m->default_max_seq));
     o.Set("weight_bytes", m->meta.weight_bytes);
     o.Set("sessions", static_cast<int64_t>(m->sessions.size()));
-    // CUDA 版**多出来**的一项：设备信息。宿主可以据此在界面上显示"跑在哪块卡上"。
+    // CUDA 版**多出来**的两项：设备信息与权重在显存里的实际占用。宿主可以据此
+    // 显示"跑在哪块卡上"与"还剩多少显存能开会话"。
     o.Set("device_available", rpg::QueryDevice(0).available);
+#ifdef RPG_HAS_CUDA
+    // 设备不可用（只读了元数据）时这一项**不出现**，而不是报 0 —— 0 会被读成
+    // "权重不占显存"，那是另一回事。
+    if (m->gpu != nullptr) {
+      o.Set("device_bytes", m->gpu->device_bytes());
+    }
+#endif
 
     return DupForAbi(JsonToAbiString(o));
   }
