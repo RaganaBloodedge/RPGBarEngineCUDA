@@ -96,6 +96,42 @@ Row BenchOnce(const rpg::GpuModel& m, int32_t n_tokens, int32_t iters) {
   return r;
 }
 
+// ---------------------------------------------------------------- 逐矩阵
+
+// 上面的表把"一层 + lm_head"合成一个数——它能定位"慢不慢"，但定位不了"谁慢"。
+// 4B 上就吃过这个亏：聚合带宽 41 GB/s 看着只是"没打满"，拆开才发现 `ffn_down`
+// 根本没走专用 kernel（cols=9728 ⇒ nb=38 > kMaxQuantBlocks），而它占每层 32%
+// 的权重字节。所以单列一张逐矩阵表：**每张矩阵各自的 ms 与有效带宽**。
+struct ItemRow {
+  const char* name;
+  const char* type;
+  int64_t rows = 0;
+  int64_t cols = 0;
+  int64_t bytes = 0;
+  double ms = 0;
+};
+
+ItemRow BenchItem(const rpg::GpuTensor& w, const char* name, int32_t n_tokens,
+                  int32_t iters) {
+  ItemRow r;
+  r.name = name;
+  r.type = w.type_name();
+  r.rows = w.rows;
+  r.cols = w.cols;
+  r.bytes = w.row_bytes() * w.rows;
+  rpg::DeviceBuffer X(static_cast<size_t>(n_tokens) * static_cast<size_t>(w.cols) * sizeof(float));
+  rpg::DeviceBuffer OUT(static_cast<size_t>(n_tokens) * static_cast<size_t>(w.rows) * sizeof(float));
+  const float* xd = static_cast<const float*>(X.data());
+  float* od = static_cast<float*>(OUT.data());
+  for (int i = 0; i < 2; ++i) rpg::GpuMatMulQuant(w, xd, n_tokens, od);
+  RPG_CUDA_CHECK(cudaDeviceSynchronize());
+  const double t0 = NowMs();
+  for (int i = 0; i < iters; ++i) rpg::GpuMatMulQuant(w, xd, n_tokens, od);
+  RPG_CUDA_CHECK(cudaDeviceSynchronize());
+  r.ms = (NowMs() - t0) / iters;
+  return r;
+}
+
 // ---------------------------------------------------------------- --verify
 //
 // "P4 重写完 matmul 之后算术没变"这句话的直接证据。
@@ -182,20 +218,99 @@ int VerifyExact(const rpg::GpuModel& m, const std::vector<int32_t>& toks) {
   return failures;
 }
 
+// ---------------------------------------------------------------- --bw 带宽天花板
+
+// 一个纯流式的显存带宽探针。**为什么必须有一个**：上面那张表给的是"matmul 拿了
+// 多少 GB/s"，但"这个数算好还是坏"取决于这台机器**实际**能跑多少 —— 拿规格书的
+// 峰值（384 GB/s）当分母会得出"只值 12%"这种结论，而 12% 到底是"kernel 写得烂"
+// 还是"这台笔记本的显存就这么快"，没有天花板就分不出来。
+//
+// 两个核都用 float4（16 字节/次）：这正是"每个线程一次读一个 1 字节"的 matmul
+// 对照 —— 同样的字节数，一次飞 16 字节和一次飞 1 字节差的就是 MLP。
+__global__ void BwCopyKernel(const float4* __restrict__ in, float4* __restrict__ out,
+                             int64_t n4) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n4; i += stride) {
+    out[i] = in[i];
+  }
+}
+
+__global__ void BwReadKernel(const float4* __restrict__ in, float* __restrict__ sink,
+                            int64_t n4) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n4; i += stride) {
+    const float4 v = in[i];
+    a.x += v.x; a.y += v.y; a.z += v.z; a.w += v.w;
+  }
+  // 写回要"不可能成立"才不会被优化掉。
+  if (a.x == 12345.678f) sink[0] = a.x + a.y + a.z + a.w;
+}
+
+int RunBwProbe(int64_t bytes) {
+  const int64_t n4 = bytes / 16;
+  rpg::DeviceBuffer a(static_cast<size_t>(bytes));
+  rpg::DeviceBuffer b(static_cast<size_t>(bytes));
+  RPG_CUDA_CHECK(cudaMemset(a.data(), 1, static_cast<size_t>(bytes)));
+  cudaDeviceProp p{};
+  RPG_CUDA_CHECK(cudaGetDeviceProperties(&p, 0));
+  const int blocks = p.multiProcessorCount * 32;
+  std::printf("\n== --bw: 纯流式显存带宽（对照 ceiling，不是规格峰值）==\n");
+  std::printf("  device %s, %d SM, %d block x 256 threads, 16 B/thread/iter\n",
+              p.name, p.multiProcessorCount, blocks);
+  std::printf("  buffer %.2f GiB x2\n", static_cast<double>(bytes) / 1073741824.0);
+  for (int rep = 0; rep < 3; ++rep) {
+    cudaEvent_t s, e;
+    RPG_CUDA_CHECK(cudaEventCreate(&s));
+    RPG_CUDA_CHECK(cudaEventCreate(&e));
+    float ms = 0.f;
+    RPG_CUDA_CHECK(cudaEventRecord(s));
+    BwCopyKernel<<<blocks, 256, 0, rpg::EngineStream()>>>(
+        static_cast<const float4*>(a.data()), static_cast<float4*>(b.data()), n4);
+    RPG_CUDA_CHECK(cudaEventRecord(e));
+    RPG_CUDA_CHECK(cudaEventSynchronize(e));
+    RPG_CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+    std::printf("  copy 2x %.2f GiB : %8.2f ms  -> %7.1f GB/s\n",
+                static_cast<double>(bytes) / 1073741824.0, ms,
+                2.0 * static_cast<double>(bytes) / (ms / 1000.0) / 1e9);
+    RPG_CUDA_CHECK(cudaEventRecord(s));
+    BwReadKernel<<<blocks, 256, 0, rpg::EngineStream()>>>(
+        static_cast<const float4*>(a.data()), static_cast<float*>(b.data()), n4);
+    RPG_CUDA_CHECK(cudaEventRecord(e));
+    RPG_CUDA_CHECK(cudaEventSynchronize(e));
+    RPG_CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+    std::printf("  read   %.2f GiB   : %8.2f ms  -> %7.1f GB/s\n",
+                static_cast<double>(bytes) / 1073741824.0, ms,
+                static_cast<double>(bytes) / (ms / 1000.0) / 1e9);
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::printf("usage: matmul_bench <model.gguf> [--iters N] [--tokens 1,4,16,64]\n"
-                "                        [--verify] [--verify-tokens 1,3,5,8]\n"
-                "  --verify: 另外跑一遍通用 kernel vs 专用 kernel 的逐位对拍\n");
-    return 2;
+  std::printf("usage: matmul_bench <model.gguf> [--iters N] [--tokens 1,4,16,64]\n"
+              "                        [--per-matrix-tokens N] [--verify] [--verify-tokens 1,3,5,8]\n"
+              "                        [--bw [GiB]]\n"
+              "  --per-matrix-tokens: 逐矩阵表在哪个 n_tokens 下量（默认 1 = decode 形状）\n"
+              "  --verify: 另外跑一遍通用 kernel vs 专用 kernel 的逐位对拍\n"
+              "  --bw: 另外量一次纯流式显存带宽（天花板；默认 1 GiB）\n");
+  return 2;
   }
   const std::string model_path = argv[1];
   int32_t iters = 20;
   std::vector<int32_t> toks = {1, 2, 4, 8, 16, 32, 64};
   bool verify = false;
   std::vector<int32_t> vtoks = {1, 3, 5, 8};
+  // 逐矩阵表在哪个 n_tokens 下量。默认 1（decode 形状）—— 但那**不是**扫参时唯一
+  // 该看的点：形状的收益在 decode 与 prefill 上是反的，只量 n=1 会把 prefill 的
+  // 结论整个漏掉（写这段之前刚踩过：以为在扫 n=64，其实逐矩阵表写死 n=1，
+  // 两次"不同 n"的扫描给出逐位相同的排名）。
+  int32_t pm_tokens = 1;
+  int64_t bw_gib = 0;
 
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -205,9 +320,13 @@ int main(int argc, char** argv) {
     };
     if (a == "--iters") iters = std::atoi(next());
     else if (a == "--tokens") toks = cli::ParseIds(next());
+    else if (a == "--per-matrix-tokens") pm_tokens = std::atoi(next());
     else if (a == "--verify") verify = true;
     else if (a == "--verify-tokens") vtoks = cli::ParseIds(next());
-    else rpg::Throw("unknown option %s", a.c_str());
+    else if (a == "--bw") {
+      bw_gib = 1;
+      if (i + 1 < argc && argv[i + 1][0] != '-') bw_gib = std::atoll(argv[++i]);
+    } else rpg::Throw("unknown option %s", a.c_str());
   }
 
   try {
@@ -243,6 +362,42 @@ int main(int argc, char** argv) {
       }
     }
 
+    // 逐矩阵表：见 BenchItem 的注释（聚合数定位不了"谁慢"）。
+    {
+      const rpg::GpuLayer& L = m.layers()[0];
+      struct Item {
+        const char* name;
+        const rpg::GpuTensor* w;
+      };
+      const Item items[] = {
+          {"attn_q", &L.attn_q},   {"attn_k", &L.attn_k},   {"attn_v", &L.attn_v},
+          {"attn_o", &L.attn_o},   {"ffn_gate", &L.ffn_gate},
+          {"ffn_up", &L.ffn_up},   {"ffn_down", &L.ffn_down},
+          {"lm_head", &m.lm_head()},
+      };
+      std::printf("\n  per-matrix, n_tokens=%d%s\n"
+                  "  --------------------------------------------------------------------\n"
+                  "  %-9s %-6s %18s %14s %8s %9s\n",
+                  pm_tokens,
+                  pm_tokens == 1 ? " (decode shape)" : " (prefill shape)",
+                  "matrix", "type", "[rows x cols]", "bytes", "ms", "GB/s");
+      int64_t total_bytes = 0;
+      double total_ms = 0.0;
+      for (const Item& it : items) {
+        const rpg::GpuTensor& w = *it.w;
+        const ItemRow r = BenchItem(w, it.name, pm_tokens, iters);
+        std::printf("  %-9s %-6s %18s %14lld %8.3f %9.1f\n", r.name, r.type,
+                    (std::to_string(r.rows) + " x " + std::to_string(r.cols)).c_str(),
+                    static_cast<long long>(r.bytes), r.ms,
+                    static_cast<double>(r.bytes) / (r.ms / 1000.0) / 1e9);
+        total_bytes += r.bytes;
+        total_ms += r.ms;
+      }
+      std::printf("  %-9s %-6s %18s %14lld %8.3f %9.1f\n", "TOTAL", "",
+                  "", static_cast<long long>(total_bytes), total_ms,
+                  static_cast<double>(total_bytes) / (total_ms / 1000.0) / 1e9);
+    }
+
     if (gbps_at_1 > 0.0) {
       // 把"一层 + lm_head"的量按整个模型的比例放大，得到 decode 每步的估计。
       // 比例 = 全部权重的字节数 / (一层 + lm_head 的字节数)。
@@ -262,6 +417,10 @@ int main(int argc, char** argv) {
           "%.1f ms (%.0f tok/s)\n",
           static_cast<double>(all_weights) / 384e9 * 1000.0,
           384e9 / static_cast<double>(all_weights));
+    }
+
+    if (bw_gib > 0) {
+      RunBwProbe(bw_gib * 1024LL * 1024 * 1024);
     }
 
     if (verify) {
