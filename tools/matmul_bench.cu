@@ -25,8 +25,10 @@
 //   matmul_bench model.gguf [--iters 20] [--tokens 1,4,16,64]
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -94,16 +96,106 @@ Row BenchOnce(const rpg::GpuModel& m, int32_t n_tokens, int32_t iters) {
   return r;
 }
 
+// ---------------------------------------------------------------- --verify
+//
+// "P4 重写完 matmul 之后算术没变"这句话的直接证据。
+//
+// P1/P2 给的是**相对误差**（p99 ≤ 1e-3），那是"数值正确"的判据 —— 它推不出
+// "逐位相同"。这里把两条路径都跑一遍（`GpuSetForceGenericMatMul` 在之间切换），
+// 对同一份权重与输入做**位比较**：只要有一个 bit 不同就是 FAIL。
+//
+// ⚠️ 用**真实权重矩阵**而不是合成数据：专用 kernel 走的是"按类型硬编码块布局"
+// 的快路径，只有真权重的块数与类型分布才确保每条分支都被走到（打印出来的
+// type= 就是覆盖证据：Q4_K 与 Q6_K 两条专用 kernel 都要出现在表里）。
+//
+// 输入用确定性的 sin 而不是随机数：随机数靠种子复现，而这里两条路径读的是
+// **同一块显存**，本来就不需要复现性 —— 确定性只是让 FAIL 时的报数可重跑。
+int VerifyExact(const rpg::GpuModel& m, const std::vector<int32_t>& toks) {
+  const rpg::GpuLayer& L = m.layers()[0];
+  struct Item {
+    const char* name;
+    const rpg::GpuTensor* w;
+  };
+  const Item items[] = {
+      {"attn_q", &L.attn_q},   {"attn_k", &L.attn_k},   {"attn_v", &L.attn_v},
+      {"attn_o", &L.attn_o},   {"ffn_gate", &L.ffn_gate},
+      {"ffn_up", &L.ffn_up},   {"ffn_down", &L.ffn_down},
+      {"lm_head", &m.lm_head()},
+  };
+
+  int failures = 0;
+  std::printf("\n== --verify: 通用 kernel vs 专用 kernel（逐位对拍）==\n");
+  for (const Item& it : items) {
+    const rpg::GpuTensor& w = *it.w;
+    RPG_CHECK(w.matrix && w.valid(), "tensor %s is not a valid matrix", it.name);
+    std::printf("  %-9s type=%-6s [%lld x %lld]\n", it.name, w.type_name(),
+                static_cast<long long>(w.rows), static_cast<long long>(w.cols));
+    for (const int32_t nt : toks) {
+      const size_t xn = static_cast<size_t>(nt) * static_cast<size_t>(w.cols);
+      const size_t on = static_cast<size_t>(nt) * static_cast<size_t>(w.rows);
+      rpg::DeviceBuffer X(xn * sizeof(float));
+      rpg::DeviceBuffer Og(on * sizeof(float));
+      rpg::DeviceBuffer Os(on * sizeof(float));
+      std::vector<float> xh(xn);
+      for (size_t i = 0; i < xn; ++i) {
+        xh[i] = static_cast<float>(std::sin(static_cast<double>(i) * 0.017) * 0.5);
+      }
+      RPG_CUDA_CHECK(cudaMemcpy(X.data(), xh.data(), xn * sizeof(float),
+                                cudaMemcpyHostToDevice));
+
+      rpg::GpuSetForceGenericMatMul(true);
+      rpg::GpuMatMulQuant(w, static_cast<const float*>(X.data()), nt,
+                          static_cast<float*>(Og.data()));
+      rpg::GpuSetForceGenericMatMul(false);
+      rpg::GpuMatMulQuant(w, static_cast<const float*>(X.data()), nt,
+                          static_cast<float*>(Os.data()));
+      RPG_CUDA_CHECK(cudaDeviceSynchronize());
+
+      std::vector<float> og(on), os(on);
+      RPG_CUDA_CHECK(cudaMemcpy(og.data(), Og.data(), on * sizeof(float),
+                                cudaMemcpyDeviceToHost));
+      RPG_CUDA_CHECK(cudaMemcpy(os.data(), Os.data(), on * sizeof(float),
+                                cudaMemcpyDeviceToHost));
+
+      size_t diff = 0, first = 0;
+      for (size_t i = 0; i < on; ++i) {
+        if (std::memcmp(&og[i], &os[i], sizeof(float)) != 0) {
+          if (diff == 0) first = i;
+          ++diff;
+        }
+      }
+      std::printf("    n_tokens=%-4d  %zu/%zu differ%s\n", nt, diff, on,
+                  diff ? "   <== FAIL" : "");
+      if (diff != 0) {
+        ++failures;
+        std::printf("      first diff @%zu: generic=%.9g specialized=%.9g\n",
+                    first, static_cast<double>(og[first]),
+                    static_cast<double>(os[first]));
+      }
+    }
+  }
+  if (failures == 0) {
+    std::printf("  => 两条路径所有用例逐位相同。\n");
+  } else {
+    std::printf("  => %d 个用例有 bit 不同。\n", failures);
+  }
+  return failures;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::printf("usage: matmul_bench <model.gguf> [--iters N] [--tokens 1,4,16,64]\n");
+    std::printf("usage: matmul_bench <model.gguf> [--iters N] [--tokens 1,4,16,64]\n"
+                "                        [--verify] [--verify-tokens 1,3,5,8]\n"
+                "  --verify: 另外跑一遍通用 kernel vs 专用 kernel 的逐位对拍\n");
     return 2;
   }
   const std::string model_path = argv[1];
   int32_t iters = 20;
   std::vector<int32_t> toks = {1, 2, 4, 8, 16, 32, 64};
+  bool verify = false;
+  std::vector<int32_t> vtoks = {1, 3, 5, 8};
 
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -113,6 +205,8 @@ int main(int argc, char** argv) {
     };
     if (a == "--iters") iters = std::atoi(next());
     else if (a == "--tokens") toks = cli::ParseIds(next());
+    else if (a == "--verify") verify = true;
+    else if (a == "--verify-tokens") vtoks = cli::ParseIds(next());
     else rpg::Throw("unknown option %s", a.c_str());
   }
 
@@ -168,6 +262,11 @@ int main(int argc, char** argv) {
           "%.1f ms (%.0f tok/s)\n",
           static_cast<double>(all_weights) / 384e9 * 1000.0,
           384e9 / static_cast<double>(all_weights));
+    }
+
+    if (verify) {
+      const int bad = VerifyExact(m, vtoks);
+      return bad == 0 ? 0 : 1;
     }
     return 0;
   } catch (const std::exception& e) {
