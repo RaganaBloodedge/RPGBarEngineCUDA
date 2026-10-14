@@ -442,6 +442,62 @@
     Latin-1 又编一遍，`权` → `c3 a6 c2 9d c2 83`）；`#pragma execution_character_set`
     同样失败。
 
+### 新增（P4 第一步：CUDA Graph）
+
+- **`EngineStream()` / `ScopedEngineStream`**：legacy default stream 不允许被
+  `cudaStreamBeginCapture` 捕获 ⇒ 加一层流抽象：默认返回 `nullptr`（不捕获时与 P0–P3
+  逐字一致），捕获窗口内切到专用流，于是所有 kernel 自动落在同一条流上、**每个 kernel
+  的启动代码一行没改**。
+- **`pos0` 暂存区**：回放时 kernel 参数被冻结 ⇒ 每步变化的 `pos0` 不能走值参。
+  `GpuRope` / `GpuKvWrite` / `GpuAttentionFromCache` 的 `pos0` 由值参改**设备指针**
+  （host 启动函数签名不变），指向一块进程级固定地址的暂存区。
+- **采样设备端 counter 路径**（`GpuSampleTokenDev`）：`counter` 也留在设备端 —— 直接
+  指向 `pos0` 暂存区（同一个数），`u = H(seed, counter)` 由 kernel 算。
+- `use_graph` **默认 false**：P0–P3 的行为逐字不变；图路径由 `tools/graph_check` 显式开。
+- 新增 `tools/graph_check.cu`、`tools/matmul_bench.cu`、`tests/run_p4.sh`。
+
+### 说明（P4 第一步）
+
+- 判据 A–E 全绿：图路径 vs 老路径**逐位相同**（贪心 / 纯采样 / 带筛选采样）、同会话
+  两段连续生成 + 断言第二段没重录图、一条不涉图的定点判据（host 算 u vs device 算 u）。
+  ⚠️ 每组比较都**必须**同时断言 `graph_exec != nullptr` —— 录不出图会静默退回老路径，
+  那样"老路径 vs 老路径"也全绿。
+- 🔴 **性能只 1.00–1.09x ⇒ 原判断"decode 慢 = 每步约 400 次 kernel 启动"被证伪。**
+  `tools/matmul_bench` 量出真瓶颈：n_tokens 1→4 耗时几乎不变 ⇒ 成本与 token 数无关，
+  由"把每个权重元素过一遍"的**逐元素反量化 ALU** 决定。
+- 顺带修掉一个真实的静默错误：`StagePos0Cached` 把暂存区当前值缓存在**函数局部
+  static**，而图回放直接调 `StagePos0` 绕过缓存 ⇒ 缓存说谎，下一个会话从位置 0 开始
+  prefill 时被判定"已经是 0"而跳过写入、那次 prefill 的 RoPE 位置全错（症状极隐蔽：
+  贪心组刚好撞对、采样组 32/32 全不同）。已把缓存搬进 `cuda_common`、由 `StagePos0`
+  独占维护。
+
+### 新增（P4 第二步：matmul 热循环重写）
+
+- **`MatMulQ4KKernel` / `MatMulQ6KKernel`**（`src/kernels_gpu.cu`）：块常量外提（每 256
+  元素一份的 d/dmin、每 32 元素（Q6_K 每 16）一份的"已乘 d 的 scale"提到元素循环外）
+  + 整行一次预计算 ⇒ 元素级只剩"取半字节 + I2F + 1 mul + 1 sub"，元素循环里**零同步**。
+- `GpuMatMulQuant` 按类型分派；F32（实际权重里只有 norm）与"块形状不符"继续走通用
+  `MatMulQuantKernel` —— 通用版与专用版**逐位等价**，退回是安全的。
+- **新增判据开关** `GpuSetForceGenericMatMul`（`src/kernels_gpu.h`）：仅供判据工具在
+  两条路径间切换，生产路径不调。
+- `tools/matmul_bench --verify`：同一份权重/输入下，通用 kernel 与专用 kernel 的输出
+  **逐位比较**（不是相对误差 —— 那是 P1 的活）。
+
+### 说明（P4 第二步）
+
+- **逐位对拍 32 个用例（8 张矩阵 × {1,3,5,8} token）全部 0 个 bit 不同**，覆盖 Q4_K 与
+  Q6_K 两条专用 kernel；最大单用例 `lm_head`（151936 行输出）也逐位相同。
+- **实测**（1.7B Q4_K_M，RTX 5060 Laptop）：matmul 有效带宽 35.7 → **52.3 GB/s**
+  （n_tokens=1，8.057 → 5.496 ms）；端到端 decode 19.0 → **26.9 tok/s**、
+  prefill 86.9 → **132.5 tok/s**。
+- 回归全绿：`check_sync` 25 一致、P1（最差 p99 1.05e-4）/ P2（逐 token 完全一致）/
+  P3 / P3-gen / P4 全过。
+- **瓶颈定位（nsys）**：matmul 占 **96.8%** 的 GPU kernel 时间（Q4K 64.6% + Q6K 32.2%），
+  RmsNorm / Attention / 其余算子合计 3.2% ⇒ 下一步仍在 matmul 上。
+- ⚠️ **两项仍未达 DESIGN §5 的目标**（decode 26.9 / 60、prefill 132.5 / 1000），且以上
+  数字全部是 **1.7B**；产品 `config.json` 跑的是 **4B**（权重约 2.3x）。P4 的最终验收口径
+  仍是"换 `.dll` 进 RPGBar、量 4B 的 DM 一轮耗时"。
+
 ### 说明（P0）
 
 - **P0 的两档判据全绿**（2026-10-12）。不需要显卡的那一档在 Windows 上跑
