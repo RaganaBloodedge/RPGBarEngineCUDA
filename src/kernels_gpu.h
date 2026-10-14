@@ -48,6 +48,15 @@ void GpuDequantRow(uint32_t type, const uint8_t* src_dev, int64_t n_elems,
 void GpuMatMulQuant(const GpuTensor& w, const float* X_dev, int64_t n_tokens,
                     float* OUT_dev);
 
+// **仅供判据工具**：强制 GpuMatMulQuant 走通用（P4 之前那版）kernel。
+// 默认关闭 —— 默认走 P4 的 Q4_K / Q6_K 专用 kernel。
+//
+// 存在的理由与"P1 故意留着无 cache 的 attention 路径"是同一个：新旧两份实现
+// 都在，才能把差异**归因**到"只是换了写法"。`tools/matmul_bench --verify` 用它
+// 做同一份权重/输入下两条路径的**逐位**对拍。生产路径不会调它。
+void GpuSetForceGenericMatMul(bool force);
+bool GpuForceGenericMatMul();
+
 // 逐行 RMSNorm：out[row] = x[row] * rsqrt(mean(x[row]²) + eps) * w
 //   n_rows 行、每行 n 个元素、行间距 stride（out 可以与 x 同一块内存）。
 // 传 stride 是为了让它同时覆盖两种用法：

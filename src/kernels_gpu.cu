@@ -40,6 +40,11 @@ constexpr int kThreads = 128;
 // 折中（再多就要加共享内存或寄存器中转）。
 constexpr int kTileTokens = 4;
 
+// 一行最多有多少个量化块（cols 上限 / 256）。专用 matmul kernel 按它开共享内存：
+// Q4_K 是 nb*8 组 (d1,m1)、Q6_K 是 nb*16 个 d*sc，各自 ×4 字节。cols 最大 8192
+// （ffn_down 的 6144 是一个实例）⇒ 32 足够；启动前 host 侧断言不超。
+constexpr int kMaxQuantBlocks = 32;
+
 // argmax 那一个 block 的线程数。词表 151936 个元素，1024 线程 → 每线程 149 个。
 // 单 block 而不是多 block + 二次归约：vocab 的量级下 1024 线程的树形归约只要
 // 10 步，多 block 反而要多一次 kernel 启动与一次中间结果回写。
@@ -137,7 +142,193 @@ __global__ void MatMulQuantKernel(uint32_t type, const uint8_t* W, int64_t rows,
   }
 }
 
-// ---------------------------------------------------------------- RMSNorm
+// --------------------------------------------- 融合点积（Q4_K / Q6_K 专用，P4 重写）
+//
+// 下面两个 kernel 与上面的 `MatMulQuantKernel` **数值语义逐位相同**，区别只有
+// "哪些量算一次、哪些量每个元素重算一遍"：
+//
+//   * 通用版走 `gpu::DeqElem`，每个元素都要重算一遍块常量 —— 两次 F16ToF32
+//     （各带一个分支和一个次正规数的 while 循环）、一次 6-bit scale/min 位拼接、
+//     三次**非收缩**乘法，约 50 条指令；而每个元素只读 0.5625 字节 ⇒ 有效带宽
+//     只有峰值的 ~10%（`tools/matmul_bench` 量出来的：n_tokens 1→4 耗时几乎不变，
+//     说明瓶颈是"每个元素的处理成本"，与 token 数无关）。
+//   * 专用版把每 256 个元素一份的 d/dmin、每 32 个元素（Q6_K 是每 16 个）一份的
+//     "已乘上 d 的 scale"提到元素循环外**算一次**，元素级只剩"取半字节 + 1 mul +
+//     1 sub"。块常量在 **block 内跨线程共享**，用共享内存承载；整行的块常量一次
+//     算完（`nb*8` 组），于是元素循环里**一次 `__syncthreads` 都不需要** ——
+//     按块算的话两次同步之间只有 2 个元素/线程的计算量，同步开销与计算量同量级。
+//
+// ⚠️ **逐位不变是硬要求**，所以下面这些一个都没动：
+//   ① 线程 → 元素的映射（`e = threadIdx.x; e < 256; e += kThreads`）；
+//   ② 累加顺序（同一 acc[i] 仍旧按 (bi, e) 的字典序累加）；
+//   ③ 树形归约（与通用版逐字相同）；
+//   ④ 三个乘法仍旧 `__fmul_rn` / `__fsub_rn` 钉死 —— 提前算出来的 (d·sc) 与
+//      (dmin·m) 存进共享内存再读回是无损的（float 存 float），元素级那两次乘减
+//      与重算一遍得到的是同一组 bit。理由见 `quant_gpu.cuh` 的头注释。
+//
+// 直接证据由 `tools/matmul_bench --verify` 给出：同一份权重与输入，通用 kernel 与
+// 专用 kernel 的输出**逐位比较**（不是比相对误差 —— 那是 P1 的活）。
+
+// Q4_K：块 144 字节 / 256 元素 = 8 个子块（每个 32 元素）。
+// 子块号 `sub` 恰好就是 `GetScaleMinK4` 的 `j`（`j = 2*(sub>>1) + (sub&1) = sub`）。
+__global__ void MatMulQ4KKernel(const uint8_t* W, int64_t rows, int64_t row_bytes,
+                                int64_t cols, const float* X, int64_t n_tokens,
+                                float* OUT) {
+  constexpr int kBlockElems = 256;
+  constexpr int kBlockBytes = 144;
+  constexpr int kSubs = 8;
+
+  const int64_t r = blockIdx.x;
+  const int64_t t0 = static_cast<int64_t>(blockIdx.y) * kTileTokens;
+  const int64_t remain = n_tokens - t0;
+  const int nt = (remain > kTileTokens) ? kTileTokens : static_cast<int>(remain);
+  const uint8_t* row = W + r * row_bytes;
+
+  float acc[kTileTokens];
+#pragma unroll
+  for (int i = 0; i < kTileTokens; ++i) acc[i] = 0.0f;
+
+  __shared__ float red[kThreads];
+  // 整行的块常量**一次算完**：(d1, m1) 共 nb*8 组，之后元素循环里没有任何同步。
+  // 数组按最坏情况开（32 个量化块 = cols 8192），host 侧启动前断言不超。
+  __shared__ float d1s[kMaxQuantBlocks * kSubs];
+  __shared__ float m1s[kMaxQuantBlocks * kSubs];
+
+  const int nb = static_cast<int>(cols / kBlockElems);
+  for (int j = threadIdx.x; j < nb * kSubs; j += kThreads) {
+    const int bi = j / kSubs;
+    const int sub = j - bi * kSubs;
+    const uint8_t* blk = row + static_cast<int64_t>(bi) * kBlockBytes;
+    const float d = gpu::F16ToF32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
+    const float dmin = gpu::F16ToF32(static_cast<uint16_t>(blk[2] | (blk[3] << 8)));
+    int sc = 0, m = 0;
+    gpu::GetScaleMinK4(sub, blk + 4, &sc, &m);
+    d1s[j] = __fmul_rn(d, static_cast<float>(sc));
+    m1s[j] = __fmul_rn(dmin, static_cast<float>(m));
+  }
+  __syncthreads();
+
+  for (int bi = 0; bi < nb; ++bi) {
+    const uint8_t* blk = row + static_cast<int64_t>(bi) * kBlockBytes;
+    const int base = bi * kSubs;
+    for (int e = threadIdx.x; e < kBlockElems; e += kThreads) {
+      const int sub = e >> 5;
+      const int l = e & 31;
+      const uint8_t* qs = blk + 16 + (sub >> 1) * 32;
+      const int raw = (sub & 1) ? (qs[l] >> 4) : (qs[l] & 0x0F);
+      const float w = __fsub_rn(__fmul_rn(d1s[base + sub], static_cast<float>(raw)),
+                                m1s[base + sub]);
+      const int64_t col = static_cast<int64_t>(bi) * kBlockElems + e;
+#pragma unroll
+      for (int i = 0; i < kTileTokens; ++i) {
+        if (i < nt) acc[i] += w * X[(t0 + i) * cols + col];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < kTileTokens; ++i) {
+    if (i >= nt) continue;
+    red[threadIdx.x] = acc[i];
+    __syncthreads();
+    for (int st = kThreads / 2; st > 0; st >>= 1) {
+      if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) OUT[(t0 + i) * rows + r] = red[0];
+    __syncthreads();
+  }
+}
+
+// Q6_K：块 210 字节 / 256 元素 = 2 个半块（各 128 元素）× 4 段（各 32 元素）×
+// 2 个 16 元素小组 = 16 个 int8 scale；d 每块一个。
+// 线程 t 的两个元素（e = t 与 t + 128）**只差一个 half**，其余下标全同 ⇒
+// 它们用同一个 scale 下标（`is + 2*quarter`），只是落在两个半块各自的 sc[] 里。
+__global__ void MatMulQ6KKernel(const uint8_t* W, int64_t rows, int64_t row_bytes,
+                                int64_t cols, const float* X, int64_t n_tokens,
+                                float* OUT) {
+  constexpr int kBlockElems = 256;
+  constexpr int kBlockBytes = 210;
+
+  const int64_t r = blockIdx.x;
+  const int64_t t0 = static_cast<int64_t>(blockIdx.y) * kTileTokens;
+  const int64_t remain = n_tokens - t0;
+  const int nt = (remain > kTileTokens) ? kTileTokens : static_cast<int>(remain);
+  const uint8_t* row = W + r * row_bytes;
+
+  float acc[kTileTokens];
+#pragma unroll
+  for (int i = 0; i < kTileTokens; ++i) acc[i] = 0.0f;
+
+  __shared__ float red[kThreads];
+  // dsc[bi*16 + half*8 + idx] = d * (float)sc[half*8 + idx]；整行 nb*16 个值一次算完。
+  __shared__ float dsc[kMaxQuantBlocks * 16];
+
+  const int nb = static_cast<int>(cols / kBlockElems);
+  for (int j = threadIdx.x; j < nb * 16; j += kThreads) {
+    const int bi = j >> 4;
+    const int half = (j >> 3) & 1;
+    const int idx = j & 7;
+    const uint8_t* blk = row + static_cast<int64_t>(bi) * kBlockBytes;
+    const float d = gpu::F16ToF32(static_cast<uint16_t>(blk[208] | (blk[209] << 8)));
+    const int8_t sc = reinterpret_cast<const int8_t*>(blk + 192 + half * 8)[idx];
+    dsc[j] = __fmul_rn(d, static_cast<float>(sc));
+  }
+  __syncthreads();
+
+  for (int bi = 0; bi < nb; ++bi) {
+    const uint8_t* blk = row + static_cast<int64_t>(bi) * kBlockBytes;
+    const int base = bi * 16;
+    for (int e = threadIdx.x; e < kBlockElems; e += kThreads) {
+      const int half = e >> 7;
+      const int rr = e & 127;
+      const int quarter = rr >> 5;
+      const int l = rr & 31;
+      const uint8_t* ql = blk + half * 64;
+      const uint8_t* qh = blk + 128 + half * 32;
+      const int is = l >> 4;
+      const uint8_t byte = ql[l + ((quarter & 1) ? 32 : 0)];
+      const int nib = (quarter < 2) ? (byte & 0x0F) : (byte >> 4);
+      const int hi = (qh[l] >> (2 * quarter)) & 3;
+      const int raw = (nib | (hi << 4)) - 32;
+      const float w = __fmul_rn(dsc[base + half * 8 + is + 2 * quarter],
+                                static_cast<float>(raw));
+      const int64_t col = static_cast<int64_t>(bi) * kBlockElems + e;
+#pragma unroll
+      for (int i = 0; i < kTileTokens; ++i) {
+        if (i < nt) acc[i] += w * X[(t0 + i) * cols + col];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < kTileTokens; ++i) {
+    if (i >= nt) continue;
+    red[threadIdx.x] = acc[i];
+    __syncthreads();
+    for (int st = kThreads / 2; st > 0; st >>= 1) {
+      if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) OUT[(t0 + i) * rows + r] = red[0];
+    __syncthreads();
+  }
+}
+
+// 是否该把这次点积分派给专用 kernel。块形状必须与上面两个 kernel 的假设一致
+// （256 元素 / 144、210 字节）—— 不一致时**宁可退回通用版**也不要静默按错的
+// 布局拆包（症状是"能出词但胡说"）。返回 false 就退通用版。
+bool MatMulHasSpecializedKernel(uint32_t type) {
+  if (type == kGgmlQ4_K) {
+    const GgmlTypeInfo* t = TypeInfo(kGgmlQ4_K);
+    return t != nullptr && t->block_elems == 256 && t->block_bytes == 144;
+  }
+  if (type == kGgmlQ6_K) {
+    const GgmlTypeInfo* t = TypeInfo(kGgmlQ6_K);
+    return t != nullptr && t->block_elems == 256 && t->block_bytes == 210;
+  }
+  return false;
+}// ---------------------------------------------------------------- RMSNorm
 
 __global__ void RmsNormKernel(const float* x, const float* w, int64_t n,
                               int64_t stride, float eps, float* out) {
@@ -479,6 +670,15 @@ unsigned GridFor(int64_t n, int threads) {
 
 // ---------------------------------------------------------------- 启动入口
 
+// 见 kernels_gpu.h：判据工具用它在"通用 kernel"与"P4 专用 kernel"之间切换。
+// 默认 false ⇒ 生产路径永远走专用 kernel。
+namespace {
+bool g_force_generic_matmul = false;
+}  // namespace
+
+void GpuSetForceGenericMatMul(bool force) { g_force_generic_matmul = force; }
+bool GpuForceGenericMatMul() { return g_force_generic_matmul; }
+
 namespace {
 
 // attention 的 scores 缓冲占多少动态共享内存。
@@ -517,9 +717,30 @@ void GpuMatMulQuant(const GpuTensor& w, const float* X_dev, int64_t n_tokens,
             static_cast<long long>(w.rows), static_cast<long long>(w.cols));
   const unsigned gy = GridFor(n_tokens, kTileTokens);
   const dim3 grid(static_cast<unsigned>(w.rows), gy);
+  const uint8_t* wdev = static_cast<const uint8_t*>(w.buf.data());
+
+  // P4：权重直算的两种主力类型走"块常量外提"的专用 kernel；其余（F32 —— 实际
+  // 权重里只有 norm 是 F32，不会走到这里）继续走通用 kernel。分派条件由
+  // MatMulHasSpecializedKernel 把关：块形状与专用 kernel 的硬编码假设不符时退回。
+  if (!g_force_generic_matmul && MatMulHasSpecializedKernel(w.type) &&
+      w.cols / bs.elems <= kMaxQuantBlocks) {
+    if (w.type == kGgmlQ4_K) {
+      MatMulQ4KKernel<<<grid, kThreads, 0, EngineStream()>>>(
+          wdev, w.rows, w.row_bytes(), w.cols, X_dev, n_tokens, OUT_dev);
+      CheckLaunch("MatMulQ4KKernel");
+    } else {
+      MatMulQ6KKernel<<<grid, kThreads, 0, EngineStream()>>>(
+          wdev, w.rows, w.row_bytes(), w.cols, X_dev, n_tokens, OUT_dev);
+      CheckLaunch("MatMulQ6KKernel");
+    }
+    return;
+  }
+  // 走到这里只有三种情况：F32（实际权重里只有 norm）、块形状与专用 kernel 的
+  // 硬编码假设不符、或一行量化块数超过专用 kernel 的共享内存预算。都是"退回通用
+  // 版"而不是报错 —— 通用版与专用版**逐位等价**（tools/matmul_bench --verify）。
   MatMulQuantKernel<<<grid, kThreads, 0, EngineStream()>>>(
-      w.type, static_cast<const uint8_t*>(w.buf.data()), w.rows, w.row_bytes(),
-      w.cols, bs.elems, bs.bytes, X_dev, n_tokens, OUT_dev);
+      w.type, wdev, w.rows, w.row_bytes(), w.cols, bs.elems, bs.bytes, X_dev,
+      n_tokens, OUT_dev);
   CheckLaunch("MatMulQuantKernel");
 }
 
