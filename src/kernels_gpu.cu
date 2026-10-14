@@ -18,6 +18,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -35,15 +36,84 @@ namespace {
 // 被寄存器卡住（融合点积里每个线程最多 4 个累加器 + 几个中间量）。
 constexpr int kThreads = 128;
 
-// 融合点积一次同时算几个 token。**这是"权重直传"能不能划算的核心参数**：
-// 权重在每个 tile 里只被反量化一遍，token 越多摊得越薄。4 是 128 线程下的
-// 折中（再多就要加共享内存或寄存器中转）。
+// 通用 kernel 用的 tile（= 专用 kernel 的 TILE 下限，保持两条路径形状可比）。
 constexpr int kTileTokens = 4;
 
-// 一行最多有多少个量化块（cols 上限 / 256）。专用 matmul kernel 按它开共享内存：
-// Q4_K 是 nb*8 组 (d1,m1)、Q6_K 是 nb*16 个 d*sc，各自 ×4 字节。cols 最大 8192
-// （ffn_down 的 6144 是一个实例）⇒ 32 足够；启动前 host 侧断言不超。
-constexpr int kMaxQuantBlocks = 32;
+// ------------------------------------------------------- 形状选择（TILE × ROWS）
+//
+// 一个 block 负责「ROWS 行 × TILE 个 token」，两个维度正交，各自解决一个瓶颈：
+//
+//   * TILE = 一个 block 装几个 token。整行权重被重读的遍数 = ceil(n/TILE) ⇒
+//     **prefill 的代价几乎全由它决定**（TILE=4 时 900 个新 token 要过 225 遍）。
+//   * ROWS = 一个 block 算几行。元素循环里 X 的读**只跟列有关、与行无关**（同一列
+//     在每一行里都是同一个输入值）⇒ R 行共用一组 X 寄存器，X 访存与 block 数都
+//     除以 R。这在 decode 上值钱：4B 的 lm_head 有 151936 行，R=1 时一个矩阵就要
+//     15.2 万个 block，而实测每个 block 光"启动 + 跑完"就要 35~113 ns。
+//
+// ⚠️ 两个维度**都在吃寄存器**（acc[ROWS][TILE] + x[TILE]），而 decode 与 prefill 的
+// 最优形状是**相反的**：
+//   * prefill（n 大）要 TILE 大 —— 多装 token 才能少重读权重；
+//   * decode（n=1）要 TILE=1 + ROWS 大 —— n=1 时 TILE>1 的槽位**全是废的**：
+//     内层 `for (i < TILE)` 里那 3 个用不上的槽位被谓词掉，但 predicated 指令
+//     照样占发射槽 ⇒ TILE=4 在 decode 上等于白跑 4 倍的发射量。
+//
+// 实测（RTX 5060 Laptop，见 tools/matmul_bench）：
+//   * TILE 单独往上走是净亏：TILE=16 ⇒ REG 96 / 13 KiB（占用率 42%）、TILE=32 ⇒
+//     REG 168 / 21 KiB（25%），单 tile 成本涨 4~8 倍。所以 TILE 只到 8。
+//   * ROWS=4 配 TILE=4 也是净亏：REG 从 40 涨到 78，占用率腰斩，lm_head
+//     51.9 → 40.1 GB/s。只有"轻的那一维"能大。
+//
+// 结论：按 n_tokens 在两条曲线之间选形状 —— decode 走 (TILE=1, ROWS 大)，
+// prefill 走 (TILE 大, ROWS=1)。
+struct MatMulShape {
+  int tile;
+  int rows;
+};
+
+// 扫参用的强制覆盖（只给 tools/matmul_bench 用，不是生产配置）：两个环境变量都设
+// 且组合在下面的实例化表里时才生效。设了非法组合会走 switch 的 default 分支报错，
+// 不会静默换一个形状。
+const MatMulShape* ForcedShape() {
+  static const MatMulShape s = [] {
+    const char* t = std::getenv("RPG_MM_TILE");
+    const char* r = std::getenv("RPG_MM_ROWS");
+    MatMulShape v{0, 0};
+    if (t != nullptr && r != nullptr) {
+      v.tile = std::atoi(t);
+      v.rows = std::atoi(r);
+    }
+    return v;
+  }();
+  return (s.tile > 0 && s.rows > 0) ? &s : nullptr;
+}
+
+// 默认策略（依据见 Temp/p4-report.txt 的三张扫参表）：
+//
+// 一个 block 的**单遍成本**几乎与它装多少 token 无关（实测 TILE=1/4/8 各约
+// 4.3 / 7.25 / 9.7 ms per pass），而整行权重的**遍数** = ceil(n/TILE)。所以总成本
+// ≈ ceil(n/TILE) × per_pass(TILE)，最优点随 n 在几个 TILE 之间跳：
+//     n = 1      → TILE=1（4.3 ms）比 TILE=4（7.25）便宜 —— n=1 时 TILE>1 的槽位全废
+//     n = 2..4   → TILE=4（7.25）胜出（ceil(2/1)=2 遍 ×4.3 = 8.6 > 7.25）
+//     n >= 5     → TILE=8（9.7）胜出（ceil(5/4)=2 遍 ×7.25 = 14.5 > 9.7）
+//
+// ROWS 一律取 2：它对 TILE=1 是明显收益（block 数减半、X 复用翻倍），对 TILE=8 也是
+// 小幅收益，而 4 以上会把 d1s/m1s 的共享内存推上去、把 occupancy 吃掉。
+MatMulShape PickShape(int64_t n_tokens) {
+  if (const MatMulShape* f = ForcedShape()) return *f;
+  if (n_tokens <= 1) return MatMulShape{1, 2};
+  if (n_tokens <= 4) return MatMulShape{4, 2};
+  return MatMulShape{8, 2};
+}
+
+// 一行最多有多少个量化块（cols / 256）。专用 matmul kernel 按它开共享内存：
+// Q4_K 是 nb*8 组 (d1,m1)、Q6_K 是 nb*16 个 d*sc，各自 ×4 字节。
+//
+// ⚠️ **这个上限原来是 32，而它是照 1.7B 的 cols 定的**（hidden 2048 / ffn 6144
+// ⇒ 最大 nb = 24）。4B 的 ffn_down 是 cols=9728 ⇒ nb=38 ⇒ 直接掉进通用慢 kernel，
+// 而它占每层 32% 的权重字节 —— 等于"4B 上有一整类矩阵从来没走过专用路径"。
+// 抬到 64 之后 4B（最大 nb=38）全在快路径上；共享内存代价是 Q4_K 2×64×8×4=4 KiB、
+// Q6_K 64×16×4=4 KiB，相对 48 KiB 的默认上限仍是小头。
+constexpr int kMaxQuantBlocks = 64;
 
 // argmax 那一个 block 的线程数。词表 151936 个元素，1024 线程 → 每线程 149 个。
 // 单 block 而不是多 block + 二次归约：vocab 的量级下 1024 线程的树形归约只要
@@ -169,8 +239,89 @@ __global__ void MatMulQuantKernel(uint32_t type, const uint8_t* W, int64_t rows,
 // 直接证据由 `tools/matmul_bench --verify` 给出：同一份权重与输入，通用 kernel 与
 // 专用 kernel 的输出**逐位比较**（不是比相对误差 —— 那是 P1 的活）。
 
+// ---------------------------------------------------- 归约与写回（TILE 张表并行）
+//
+// 树形归约的**加法序列与通用 kernel 逐字相同**：
+//     part[i][t] = acc[i]_t；随后 st = 64,32,…,1，每一步 part[i][t] += part[i][t+st]；
+//     最后 part[i][0] 就是第 i 个 token 的输出。
+//
+// ⚠️ 唯一的区别是**交错**：这里把 TILE 个 token 的归约并起来做（一次 8 步），原来
+// 是每个 token 各 8 步、串行做完 TILE 次。__syncthreads 不是算术（它不参与浮点
+// 结果），把哪些 token 的加法放进同一个同步区间**不改变任何一个加法的操作数与
+// 顺序** ⇒ 输出逐位相同。行与行之间是**串行**做的（每行 8 步），所以 part 只需要
+// TILE*kThreads 这么大，不必再乘 ROWS。
+template <int TILE, int ROWS>
+__device__ __forceinline__ void ReduceAndStore(float* part,
+                                               const float (&acc)[ROWS][TILE],
+                                               int nrow, int nt, float* OUT,
+                                               int64_t rows, int64_t r0, int64_t t0) {
+#pragma unroll
+  for (int rr = 0; rr < ROWS; ++rr) {
+#pragma unroll
+    for (int i = 0; i < TILE; ++i) part[i * kThreads + threadIdx.x] = acc[rr][i];
+    __syncthreads();
+    // 所有线程都要走到每一步（哪怕 i >= nt 的那几张表装的是垃圾）—— 同步不能分叉。
+    for (int st = kThreads / 2; st > 0; st >>= 1) {
+#pragma unroll
+      for (int i = 0; i < TILE; ++i) {
+        if (threadIdx.x < st) {
+          part[i * kThreads + threadIdx.x] += part[i * kThreads + threadIdx.x + st];
+        }
+      }
+      __syncthreads();
+    }
+    // 越界的行（最后一个 block）照样参与归约，只是不写回 —— 循环里就不用分叉了。
+#pragma unroll
+    for (int i = 0; i < TILE; ++i) {
+      if (i < nt && rr < nrow && threadIdx.x == 0) {
+        OUT[(t0 + i) * rows + (r0 + rr)] = part[i * kThreads];
+      }
+    }
+    __syncthreads();   // 复用 part 之前必须同步
+  }
+}
+
+// ------------------------------------ 动态共享内存布局（host 启动 / device 取址共用）
+//
+// 为什么必须动态：常量表按**一行**算就是 nb*8（Q4_K）或 nb*16（Q6_K）个 float，
+// 而静态数组只能按最坏情况开（cols 上限 ⇒ 64 个量化块 = 2~4 KiB）。4B 的实际 nb
+// 只有 10~38 —— 按最坏情况开等于白扔一半共享内存，而共享内存直接决定每个 SM 能
+// 驻几个 block。
+//
+// 三段的大小都由下面两个函数算，**host 与 device 用同一个公式**（抄两份必漂，
+// 而且只在 nb 跨过某个值时暴露）。布局顺序固定：
+//     d1s[ROWS*nb*kSubs] | m1s[ROWS*nb*kSubs] | part[TILE*kThreads]
+// （Q6_K 的 dsc 就是 d1s 那一段，宽度换成 16。）
+template <int TILE, int ROWS>
+size_t Q4KShmemFloats(int nb) {
+  return 2u * static_cast<size_t>(ROWS) * nb * 8u +
+         static_cast<size_t>(TILE) * kThreads;
+}
+template <int TILE, int ROWS>
+size_t Q6KShmemFloats(int nb) {
+  return static_cast<size_t>(ROWS) * nb * 16u +
+         static_cast<size_t>(TILE) * kThreads;
+}
+
 // Q4_K：块 144 字节 / 256 元素 = 8 个子块（每个 32 元素）。
 // 子块号 `sub` 恰好就是 `GetScaleMinK4` 的 `j`（`j = 2*(sub>>1) + (sub&1) = sub`）。
+//
+// 两个"一个 block 干多少活"的模板参数，都不参与任何算术（怎么选见 PickShape）：
+//   * TILE = 这个 block 负责几个 token —— 越大，整行权重被重读的遍数越少
+//     （遍数 = ceil(n / TILE)），prefill 的代价几乎全由它决定；
+//   * ROWS = 这个 block 负责几行 —— 越大，同一组 X 值被复用的次数越多。
+//
+// 为什么 ROWS 这一维值钱：元素循环里 X 的读**只跟列有关**，与行无关（同一列在每
+// 一行里都是同一个输入值）。把 R 行放进同一个 block，一组 X 就能喂 R 行，X 的访存
+// 直接除以 R。而 X 的访存量本来是 `rows * n * cols` 量级、与权重字节同阶甚至更大：
+// 4B 的 lm_head 有 151936 行，n=1 时它一个矩阵就要 15.2 万个 block —— 实测成本
+// 几乎与 block 数成正比（各矩阵都落在 35~113 ns/block），也就是说这台机器上
+// "启动并把一个 block 跑完"本身就要 ~100 ns，而那个 block 真正读的权重只有 2 KB。
+//
+// ⚠️ 逐位不变仍然成立：每个输出元素 (rr, i) 的部分和依旧由**同一个线程**按 (bi, e)
+// 的字典序累加（多出来的只是"哪个 block 在算"，行的循环不改变累加序），树形归约
+// 的加法序列也一字未动。
+template <int TILE, int ROWS>
 __global__ void MatMulQ4KKernel(const uint8_t* W, int64_t rows, int64_t row_bytes,
                                 int64_t cols, const float* X, int64_t n_tokens,
                                 float* OUT) {
@@ -178,27 +329,37 @@ __global__ void MatMulQ4KKernel(const uint8_t* W, int64_t rows, int64_t row_byte
   constexpr int kBlockBytes = 144;
   constexpr int kSubs = 8;
 
-  const int64_t r = blockIdx.x;
-  const int64_t t0 = static_cast<int64_t>(blockIdx.y) * kTileTokens;
+  const int64_t r0 = static_cast<int64_t>(blockIdx.x) * ROWS;
+  const int64_t t0 = static_cast<int64_t>(blockIdx.y) * TILE;
+  const int64_t nrow64 = rows - r0;
+  const int nrow = (nrow64 > ROWS) ? ROWS : static_cast<int>(nrow64);
   const int64_t remain = n_tokens - t0;
-  const int nt = (remain > kTileTokens) ? kTileTokens : static_cast<int>(remain);
-  const uint8_t* row = W + r * row_bytes;
+  const int nt = (remain > TILE) ? TILE : static_cast<int>(remain);
 
-  float acc[kTileTokens];
+  // acc 用固定长度 + 编译期展开的谓词，保证它留在寄存器里；写成
+  // `for (i < nt)` 会让下标变成动态 → 整个数组被打到 local memory。
+  float acc[ROWS][TILE];
 #pragma unroll
-  for (int i = 0; i < kTileTokens; ++i) acc[i] = 0.0f;
-
-  __shared__ float red[kThreads];
-  // 整行的块常量**一次算完**：(d1, m1) 共 nb*8 组，之后元素循环里没有任何同步。
-  // 数组按最坏情况开（32 个量化块 = cols 8192），host 侧启动前断言不超。
-  __shared__ float d1s[kMaxQuantBlocks * kSubs];
-  __shared__ float m1s[kMaxQuantBlocks * kSubs];
+  for (int rr = 0; rr < ROWS; ++rr) {
+#pragma unroll
+    for (int i = 0; i < TILE; ++i) acc[rr][i] = 0.0f;
+  }
 
   const int nb = static_cast<int>(cols / kBlockElems);
-  for (int j = threadIdx.x; j < nb * kSubs; j += kThreads) {
-    const int bi = j / kSubs;
-    const int sub = j - bi * kSubs;
-    const uint8_t* blk = row + static_cast<int64_t>(bi) * kBlockBytes;
+  extern __shared__ float smem[];
+  float* d1s = smem;
+  float* m1s = smem + static_cast<size_t>(ROWS) * nb * kSubs;
+  float* part = m1s + static_cast<size_t>(ROWS) * nb * kSubs;
+
+  // 整行的块常量**一次算完**：(d1, m1) 共 ROWS*nb*8 组，之后元素循环里没有任何同步。
+  for (int j = threadIdx.x; j < ROWS * nb * kSubs; j += kThreads) {
+    const int rr = j / (nb * kSubs);
+    const int jj = j - rr * (nb * kSubs);
+    if (rr >= nrow) continue;
+    const int bi = jj / kSubs;
+    const int sub = jj - bi * kSubs;
+    const uint8_t* blk =
+        W + (r0 + rr) * row_bytes + static_cast<int64_t>(bi) * kBlockBytes;
     const float d = gpu::F16ToF32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
     const float dmin = gpu::F16ToF32(static_cast<uint16_t>(blk[2] | (blk[3] << 8)));
     int sc = 0, m = 0;
@@ -208,111 +369,128 @@ __global__ void MatMulQ4KKernel(const uint8_t* W, int64_t rows, int64_t row_byte
   }
   __syncthreads();
 
+  // ⚠️ `#pragma unroll 4` 不是为了省指令，是为了**让 4 个量化块的字节读同时在飞**：
+  // 循环体里每个线程只读 1~2 个字节，不展开的话每次迭代都要等上一次的显存往返，
+  // 而一个 block 只有 nb（4B 上 10~38）次迭代。展开后 4 次迭代的地址互相独立。
+#pragma unroll 4
   for (int bi = 0; bi < nb; ++bi) {
-    const uint8_t* blk = row + static_cast<int64_t>(bi) * kBlockBytes;
     const int base = bi * kSubs;
+    const int64_t col0 = static_cast<int64_t>(bi) * kBlockElems;
     for (int e = threadIdx.x; e < kBlockElems; e += kThreads) {
       const int sub = e >> 5;
       const int l = e & 31;
-      const uint8_t* qs = blk + 16 + (sub >> 1) * 32;
-      const int raw = (sub & 1) ? (qs[l] >> 4) : (qs[l] & 0x0F);
-      const float w = __fsub_rn(__fmul_rn(d1s[base + sub], static_cast<float>(raw)),
-                                m1s[base + sub]);
-      const int64_t col = static_cast<int64_t>(bi) * kBlockElems + e;
+      const int64_t col = col0 + e;
+      // X 只跟列有关 ⇒ 先读进寄存器，下面 ROWS 行共用这一组值。
+      float x[TILE];
 #pragma unroll
-      for (int i = 0; i < kTileTokens; ++i) {
-        if (i < nt) acc[i] += w * X[(t0 + i) * cols + col];
+      for (int i = 0; i < TILE; ++i) {
+        x[i] = (i < nt) ? X[(t0 + i) * cols + col] : 0.0f;
+      }
+#pragma unroll
+      for (int rr = 0; rr < ROWS; ++rr) {
+        if (rr >= nrow) continue;
+        const uint8_t* blk =
+            W + (r0 + rr) * row_bytes + static_cast<int64_t>(bi) * kBlockBytes;
+        const uint8_t* qs = blk + 16 + (sub >> 1) * 32;
+        const int raw = (sub & 1) ? (qs[l] >> 4) : (qs[l] & 0x0F);
+        const int off = rr * nb * kSubs + base + sub;
+        const float w = __fsub_rn(__fmul_rn(d1s[off], static_cast<float>(raw)),
+                                  m1s[off]);
+#pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+          if (i < nt) acc[rr][i] += w * x[i];
+        }
       }
     }
   }
 
-#pragma unroll
-  for (int i = 0; i < kTileTokens; ++i) {
-    if (i >= nt) continue;
-    red[threadIdx.x] = acc[i];
-    __syncthreads();
-    for (int st = kThreads / 2; st > 0; st >>= 1) {
-      if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
-      __syncthreads();
-    }
-    if (threadIdx.x == 0) OUT[(t0 + i) * rows + r] = red[0];
-    __syncthreads();
-  }
+  ReduceAndStore<TILE, ROWS>(part, acc, nrow, nt, OUT, rows, r0, t0);
 }
 
 // Q6_K：块 210 字节 / 256 元素 = 2 个半块（各 128 元素）× 4 段（各 32 元素）×
 // 2 个 16 元素小组 = 16 个 int8 scale；d 每块一个。
 // 线程 t 的两个元素（e = t 与 t + 128）**只差一个 half**，其余下标全同 ⇒
 // 它们用同一个 scale 下标（`is + 2*quarter`），只是落在两个半块各自的 sc[] 里。
+// （TILE / ROWS 的含义与 Q4_K 版完全一致。）
+template <int TILE, int ROWS>
 __global__ void MatMulQ6KKernel(const uint8_t* W, int64_t rows, int64_t row_bytes,
                                 int64_t cols, const float* X, int64_t n_tokens,
                                 float* OUT) {
   constexpr int kBlockElems = 256;
   constexpr int kBlockBytes = 210;
 
-  const int64_t r = blockIdx.x;
-  const int64_t t0 = static_cast<int64_t>(blockIdx.y) * kTileTokens;
+  const int64_t r0 = static_cast<int64_t>(blockIdx.x) * ROWS;
+  const int64_t t0 = static_cast<int64_t>(blockIdx.y) * TILE;
+  const int64_t nrow64 = rows - r0;
+  const int nrow = (nrow64 > ROWS) ? ROWS : static_cast<int>(nrow64);
   const int64_t remain = n_tokens - t0;
-  const int nt = (remain > kTileTokens) ? kTileTokens : static_cast<int>(remain);
-  const uint8_t* row = W + r * row_bytes;
+  const int nt = (remain > TILE) ? TILE : static_cast<int>(remain);
 
-  float acc[kTileTokens];
+  float acc[ROWS][TILE];
 #pragma unroll
-  for (int i = 0; i < kTileTokens; ++i) acc[i] = 0.0f;
-
-  __shared__ float red[kThreads];
-  // dsc[bi*16 + half*8 + idx] = d * (float)sc[half*8 + idx]；整行 nb*16 个值一次算完。
-  __shared__ float dsc[kMaxQuantBlocks * 16];
+  for (int rr = 0; rr < ROWS; ++rr) {
+#pragma unroll
+    for (int i = 0; i < TILE; ++i) acc[rr][i] = 0.0f;
+  }
 
   const int nb = static_cast<int>(cols / kBlockElems);
-  for (int j = threadIdx.x; j < nb * 16; j += kThreads) {
-    const int bi = j >> 4;
-    const int half = (j >> 3) & 1;
-    const int idx = j & 7;
-    const uint8_t* blk = row + static_cast<int64_t>(bi) * kBlockBytes;
+  extern __shared__ float smem[];
+  float* dsc = smem;   // dsc[rr*nb*16 + bi*16 + half*8 + idx] = d * sc
+  float* part = smem + static_cast<size_t>(ROWS) * nb * 16;
+
+  for (int j = threadIdx.x; j < ROWS * nb * 16; j += kThreads) {
+    const int rr = j / (nb * 16);
+    const int jj = j - rr * (nb * 16);
+    if (rr >= nrow) continue;
+    const int bi = jj >> 4;
+    const int half = (jj >> 3) & 1;
+    const int idx = jj & 7;
+    const uint8_t* blk =
+        W + (r0 + rr) * row_bytes + static_cast<int64_t>(bi) * kBlockBytes;
     const float d = gpu::F16ToF32(static_cast<uint16_t>(blk[208] | (blk[209] << 8)));
     const int8_t sc = reinterpret_cast<const int8_t*>(blk + 192 + half * 8)[idx];
     dsc[j] = __fmul_rn(d, static_cast<float>(sc));
   }
   __syncthreads();
 
+  // 展开的理由见 Q4_K 版同一处注释（把 4 个量化块的字节读同时发出去）。
+#pragma unroll 4
   for (int bi = 0; bi < nb; ++bi) {
-    const uint8_t* blk = row + static_cast<int64_t>(bi) * kBlockBytes;
     const int base = bi * 16;
+    const int64_t col0 = static_cast<int64_t>(bi) * kBlockElems;
     for (int e = threadIdx.x; e < kBlockElems; e += kThreads) {
       const int half = e >> 7;
       const int rr = e & 127;
       const int quarter = rr >> 5;
       const int l = rr & 31;
-      const uint8_t* ql = blk + half * 64;
-      const uint8_t* qh = blk + 128 + half * 32;
-      const int is = l >> 4;
-      const uint8_t byte = ql[l + ((quarter & 1) ? 32 : 0)];
-      const int nib = (quarter < 2) ? (byte & 0x0F) : (byte >> 4);
-      const int hi = (qh[l] >> (2 * quarter)) & 3;
-      const int raw = (nib | (hi << 4)) - 32;
-      const float w = __fmul_rn(dsc[base + half * 8 + is + 2 * quarter],
-                                static_cast<float>(raw));
-      const int64_t col = static_cast<int64_t>(bi) * kBlockElems + e;
+      const int64_t col = col0 + e;
+      float x[TILE];
 #pragma unroll
-      for (int i = 0; i < kTileTokens; ++i) {
-        if (i < nt) acc[i] += w * X[(t0 + i) * cols + col];
+      for (int i = 0; i < TILE; ++i) {
+        x[i] = (i < nt) ? X[(t0 + i) * cols + col] : 0.0f;
+      }
+#pragma unroll
+      for (int row_i = 0; row_i < ROWS; ++row_i) {
+        if (row_i >= nrow) continue;
+        const uint8_t* blk =
+            W + (r0 + row_i) * row_bytes + static_cast<int64_t>(bi) * kBlockBytes;
+        const int is = l >> 4;
+        const uint8_t byte = blk[half * 64 + l + ((quarter & 1) ? 32 : 0)];
+        const int nib = (quarter < 2) ? (byte & 0x0F) : (byte >> 4);
+        const int hi = (blk[128 + half * 32 + l] >> (2 * quarter)) & 3;
+        const int raw = (nib | (hi << 4)) - 32;
+        const float w = __fmul_rn(
+            dsc[row_i * nb * 16 + base + half * 8 + is + 2 * quarter],
+            static_cast<float>(raw));
+#pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+          if (i < nt) acc[row_i][i] += w * x[i];
+        }
       }
     }
   }
 
-#pragma unroll
-  for (int i = 0; i < kTileTokens; ++i) {
-    if (i >= nt) continue;
-    red[threadIdx.x] = acc[i];
-    __syncthreads();
-    for (int st = kThreads / 2; st > 0; st >>= 1) {
-      if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
-      __syncthreads();
-    }
-    if (threadIdx.x == 0) OUT[(t0 + i) * rows + r] = red[0];
-    __syncthreads();
-  }
+  ReduceAndStore<TILE, ROWS>(part, acc, nrow, nt, OUT, rows, r0, t0);
 }
 
 // 是否该把这次点积分派给专用 kernel。块形状必须与上面两个 kernel 的假设一致
@@ -328,7 +506,60 @@ bool MatMulHasSpecializedKernel(uint32_t type) {
     return t != nullptr && t->block_elems == 256 && t->block_bytes == 210;
   }
   return false;
-}// ---------------------------------------------------------------- RMSNorm
+}
+
+// 按 (TILE, ROWS) 实例化启动专用 kernel（Q4_K / Q6_K 各自一个模板）。
+// 动态共享内存的大小与内核里取址用的是**同一个公式**（Q4K/Q6KShmemFloats）。
+template <int TILE, int ROWS>
+void LaunchSpecialized(uint32_t type, const dim3& grid, const uint8_t* wdev,
+                       const GpuTensor& w, const float* X_dev, int64_t n_tokens,
+                       float* OUT_dev) {
+  const int nb = static_cast<int>(w.cols / 256);
+  if (type == kGgmlQ4_K) {
+    const size_t sh = Q4KShmemFloats<TILE, ROWS>(nb) * sizeof(float);
+    MatMulQ4KKernel<TILE, ROWS><<<grid, kThreads, sh, EngineStream()>>>(
+        wdev, w.rows, w.row_bytes(), w.cols, X_dev, n_tokens, OUT_dev);
+    CheckLaunch("MatMulQ4KKernel");
+  } else {
+    const size_t sh = Q6KShmemFloats<TILE, ROWS>(nb) * sizeof(float);
+    MatMulQ6KKernel<TILE, ROWS><<<grid, kThreads, sh, EngineStream()>>>(
+        wdev, w.rows, w.row_bytes(), w.cols, X_dev, n_tokens, OUT_dev);
+    CheckLaunch("MatMulQ6KKernel");
+  }
+}
+
+// 把 host 侧挑出来的形状落到编译期实例上。形状只可能来自 PickShape（默认策略）
+// 或 ForcedShape（扫参）—— 两者都在下面这张表里，所以 default 分支是"不可能发生"：
+// 真发生了就**报错**，而不是静默换一个形状（那会让"我改的形状"和"实际跑的形状"
+// 不一致，而这两者不一致时量到的收益归因不到任何东西上）。
+void LaunchSpecializedByShape(const MatMulShape& s, uint32_t type, const dim3& grid,
+                              const uint8_t* wdev, const GpuTensor& w,
+                              const float* X_dev, int64_t n_tokens, float* OUT_dev) {
+#define RPG_MM_CASE(T, R)                                                     \
+  if (s.tile == (T) && s.rows == (R)) {                                       \
+    LaunchSpecialized<(T), (R)>(type, grid, wdev, w, X_dev, n_tokens, OUT_dev); \
+    return;                                                                    \
+  }
+  // 扫参用到的全部组合（见 Temp/p4-report.txt 的表格）；生产策略见 PickShape。
+  RPG_MM_CASE(1, 1)
+  RPG_MM_CASE(1, 2)
+  RPG_MM_CASE(1, 4)
+  RPG_MM_CASE(1, 8)
+  RPG_MM_CASE(2, 4)
+  RPG_MM_CASE(4, 1)
+  RPG_MM_CASE(4, 2)
+  RPG_MM_CASE(4, 4)
+  RPG_MM_CASE(8, 1)
+  RPG_MM_CASE(8, 2)
+  RPG_MM_CASE(8, 4)
+  RPG_MM_CASE(16, 1)
+  RPG_MM_CASE(16, 2)
+  RPG_MM_CASE(16, 4)
+#undef RPG_MM_CASE
+  RPG_CHECK(false, "unsupported matmul shape (tile=%d, rows=%d)", s.tile, s.rows);
+}
+
+// ---------------------------------------------------------------- RMSNorm
 
 __global__ void RmsNormKernel(const float* x, const float* w, int64_t n,
                               int64_t stride, float eps, float* out) {
@@ -715,26 +946,25 @@ void GpuMatMulQuant(const GpuTensor& w, const float* X_dev, int64_t n_tokens,
   RPG_CHECK(w.buf.size() == static_cast<size_t>(w.rows) * w.row_bytes(),
             "tensor byte count does not match the [%lld,%lld] shape; this should have been caught at load time",
             static_cast<long long>(w.rows), static_cast<long long>(w.cols));
-  const unsigned gy = GridFor(n_tokens, kTileTokens);
-  const dim3 grid(static_cast<unsigned>(w.rows), gy);
   const uint8_t* wdev = static_cast<const uint8_t*>(w.buf.data());
 
   // P4：权重直算的两种主力类型走"块常量外提"的专用 kernel；其余（F32 —— 实际
   // 权重里只有 norm 是 F32，不会走到这里）继续走通用 kernel。分派条件由
   // MatMulHasSpecializedKernel 把关：块形状与专用 kernel 的硬编码假设不符时退回。
+  //
+  // 形状按 n_tokens 挑（见 PickShape）：decode 走 (TILE=1, ROWS=8)，prefill 走
+  // (TILE=8, ROWS=1) —— 前者避免 n=1 时 TILE 槽位空转，后者避免整行权重被重读
+  // ceil(n/8) 遍。**算术一字未动**，变的只是"哪个 block 算哪些输出"。
   if (!g_force_generic_matmul && MatMulHasSpecializedKernel(w.type) &&
       w.cols / bs.elems <= kMaxQuantBlocks) {
-    if (w.type == kGgmlQ4_K) {
-      MatMulQ4KKernel<<<grid, kThreads, 0, EngineStream()>>>(
-          wdev, w.rows, w.row_bytes(), w.cols, X_dev, n_tokens, OUT_dev);
-      CheckLaunch("MatMulQ4KKernel");
-    } else {
-      MatMulQ6KKernel<<<grid, kThreads, 0, EngineStream()>>>(
-          wdev, w.rows, w.row_bytes(), w.cols, X_dev, n_tokens, OUT_dev);
-      CheckLaunch("MatMulQ6KKernel");
-    }
+    const MatMulShape s = PickShape(n_tokens);
+    // 行方向按 ROWS 分组，token 方向按 TILE 分组。两者都只是"一个 block 干多少活"。
+    const dim3 grid(static_cast<unsigned>((w.rows + s.rows - 1) / s.rows),
+                    GridFor(n_tokens, s.tile));
+    LaunchSpecializedByShape(s, w.type, grid, wdev, w, X_dev, n_tokens, OUT_dev);
     return;
   }
+  const dim3 grid(static_cast<unsigned>(w.rows), GridFor(n_tokens, kTileTokens));
   // 走到这里只有三种情况：F32（实际权重里只有 norm）、块形状与专用 kernel 的
   // 硬编码假设不符、或一行量化块数超过专用 kernel 的共享内存预算。都是"退回通用
   // 版"而不是报错 —— 通用版与专用版**逐位等价**（tools/matmul_bench --verify）。
