@@ -3,9 +3,10 @@
 [RPGBarEngine](https://github.com/RaganaBloodedge/RPGBarEngine) 的 **GPU（CUDA）实现** ——
 同一套 C ABI、同一份 GGUF 权重、同一套外部行为，前向计算跑在显卡上。
 
-**为什么要有它**：RPGBar 的 DM 一次回合在 CPU 上要 **211 秒**（Qwen3-1.7B Q4_K_M，
+**为什么要有它**：RPGBar 的 DM 一次回合在 CPU 上要 **109–199 秒**（Qwen3-1.7B Q4_K_M，
 16 线程：首轮 2811 token 的 prefill + 三轮工具循环）。把同一份权重放到 RTX 5060 上，
-目标是把这一轮压到 **2 秒以内**。
+原本的目标是把这一轮压到 **2 秒以内** —— 实测落在 **21–38 秒（比 CPU 快 4.1–5.3×）**，
+"几秒级"没做到。这不是没优化，而是 P4 把原因量清楚了，见下面「P4 实测」。
 
 **为什么是独立仓库**：[设计文档 §1](docs/DESIGN.md) 讲了三个理由，一句话 ——
 CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现共用一份 ABI，
@@ -18,8 +19,8 @@ CUDA 工具链不该绑架"只要一个 g++ 就能编"的 CPU 版；两个实现
 | P0 | 工具链与骨架（ABI 层、CMake、`cuda_check`） | ✅ **完成** —— 两档判据全绿 |
 | P1 | 权重上卡 + 整网前向对拍 | ✅ **完成** —— 两条判据全绿（见下） |
 | P2 | KV Cache（fp16）+ 增量解码 + 贪心逐 token 对拍 | ✅ **完成** —— 三条判据全绿，**32/32 个 token 与 CPU 引擎完全一致** |
-| P3 | 采样 + **接入 ABI**（`generate` 已实现）/ 工具调用 / 接入 RPGBar | ✅ **完成** —— 采样三条判据全绿；ABI 的 `generate` 真的在生成（`abi_smoke` **38/0**）；**Windows 侧 `.dll` 已编出来并跑通**（`build_win.ps1`），已经换进 RPGBar 的 `models/rpg_engine_cuda.dll`，`smoke_test.py` 258/0、`ui_check.js` 115/0、游戏里真的在 GPU 上出字 |
-| P4 | 融合 kernel、CUDA Graph、量化直算 | 未开始 |
+| P3 | 采样 + **接入 ABI**（`generate` 已实现）/ 工具调用 / 接入 RPGBar | ✅ **完成** —— 采样三条判据全绿；ABI 的 `generate` 真的在生成（`abi_smoke` **38/0**）；**Windows 侧 `.dll` 已编出来并跑通**（`build_win.ps1`），已经换进 RPGBar 的 `models/rpg_engine_cuda.dll`，`scripts/smoke_test.py --unit` 357/0、`ui_check.js` 170/0、游戏里真的在 GPU 上出字 |
+| P4 | 融合 kernel、CUDA Graph、量化直算、形状策略 | ✅ **四步全完成** —— 判据全绿（逐位对拍 0 bit 不同）；但**引擎的 decode 没跟着快**（kernel 1.56× ⇒ 引擎 ~1.05×，原判断被证伪），详见下面「P4 实测」 |
 
 **P1 的一句话结论**：同一份 GGUF、同一串 token，GPU 的 28 层前向与 CPU 引擎**逐层对得上**
 （残差流最差 p99 = **1.05e-4**，判据 1e-3；argmax 21/21 一致），反量化**逐位相同**（0 bit 差异）。
@@ -30,6 +31,8 @@ GPU prefill 21 token 只用 **213.7 ms**，同一份 CPU 跑 **3081.1 ms** ⇒ *
 约 1.3 个 fp16 ULP）。KV 写入的下标映射另有一条**不需要模型**的确定性判据（逐位相同）。
 ⚠️ 但 decode 只比 CPU 快 **1.5 倍** —— 瓶颈已经从"算力"变成"每步约 400 次 kernel 启动
 + 一次同步"，那是 P4 的 CUDA Graph 要解决的事（见 [设计文档 §5](docs/DESIGN.md)）。
+> ⚠️ **这句话后来被 P4 自己证伪了**：CUDA Graph 只值 **1.00–1.09×**，真瓶颈是
+> **逐元素反量化的 ALU**（已修）与 **kernel 之间的依赖链**（修不掉）。见下面「P4 实测」。
 
 **P3 第一步（设备端采样）的一句话结论**：`temperature` / `top_k` / `top_p` 与
 counter-based 随机源都在 GPU 上跑通了，判据**不需要模型、不需要权重**（喂同一份从文件读的
@@ -93,6 +96,46 @@ Windows SDK 的位置（`nvcc --version` 不调，所以看不出来）。放行
    编译通过、字节是错的**（中文被二次编码，`权` 变成 5 字节 `c3 a6 c2 9d c2 83`）。
 
 没有 Toolkit 时这个仓库仍能编译（host 部分），只是 `generate` 会明确报"未编译 CUDA 后端"。
+
+**P4（四步全完成）的一句话结论**：**逐位对拍全绿，但引擎的 decode 几乎没跟着快** ——
+三步改造（① CUDA Graph、② Q4_K/Q6_K matmul 热循环重写、③ `(TILE, ROWS)` 形状策略）
+每一层都过了判据，**kernel 本身快了 1.56×、端到端只快 ~1.05×**，`4B` 的 prefill 也只
+**1.30×**。P4 最有价值的产出不是提速，而是**把"慢在哪"量清楚了**，并且**证伪了两条原判断**。
+
+做了三件事（细节见 [CHANGELOG.md](CHANGELOG.md) 的 P4 三步改造 + 一次整轮实测收口与 [设计文档](docs/DESIGN.md) §5）：
+
+| 步 | 改了什么 | 结果 |
+| --- | --- | --- |
+| 1 | **CUDA Graph**：`EngineStream` 流抽象 + `pos0` 设备暂存区 + 设备端采样 counter（`use_graph` 默认 false） | 判据 A–E 全绿（图路径 vs 老路径**逐位相同**）；性能只 **1.00–1.09×** |
+| 2 | **matmul 热循环重写**：块常量外提、元素循环零 `__syncthreads`，与通用版**逐位等价** | matmul 有效带宽 **35.7 → 52.3 GB/s**（n=1）；1.7B decode **19.0 → 26.9 tok/s**、prefill **86.9 → 132.5 tok/s** |
+| 3 | **`(TILE, ROWS)` 形状策略**：`PickShape(n)` —— n≤1→`(1,2)`、2–4→`(4,2)`、≥5→`(8,2)`，组合不在表里**直接报错** | 4B 受控 A/B：prefill **74.8–80.9 → 101.9–104.8 tok/s（1.30×）**、decode **14.0–16.0 → 16.8–16.9（~1.05×）**；逐矩阵 n=1 **6.890 → 4.413 ms**（**1.56×**） |
+
+🔴 **量出来的两条硬结论（都比提速重要）**：
+
+1. **"decode 慢 = 每步约 400 次 kernel 启动"是错的。** CUDA Graph 把几百次启动摊成一次，
+   却只值 1.00–1.09× ⇒ 启动开销从来不是瓶颈。`matmul_bench` 量出真瓶颈曾是
+   **逐元素反量化的 ALU**（n_tokens 1→4 耗时几乎不变 ⇒ 成本与 token 数无关）——
+   第二步修的就是它。
+2. **kernel 快了，引擎没快：decode 的时间不在 kernel 里，在 kernel 之间的空隙里。**
+   按"每 token = 36 层 + 1 次 lm_head"折算，bench 预测 decode 应快 **1.85×**，实测 **1.0×**。
+   自洽的解释是：bench 是"同一张矩阵连跑 10 遍"（**无依赖**，前一个 kernel 的尾巴能与后一个的头重叠），
+   而引擎是**一条 ~289 个互相依赖的 kernel 链**，每个 kernel 的 ramp/drain 都被完整暴露。
+   ⇒ 这同时也解释了 Graph 为什么只值 1.0×：**瓶颈是依赖链本身。**
+
+❌ **一个被自己证伪的乐观估计**：第二步曾报告"参数化 `kTileTokens` ⇒ prefill 潜在 4–10×"。
+遍数模型成立（成本 ≈ `ceil(n/TILE) × per_pass`），但 **`TILE` 上不去**：`TILE=16` 的寄存器
+占用让占用率腰斩，n=64 / 256 两个尺度都**净亏** ⇒ 实收只有 **1.30×**。已作废。
+
+**整轮实测（4B，同一份新 `.dll`、只改配置、各 3 轮）**：**单模型**（三槽位都 4B、ctx 6144）
+= **129.4 / 65.0 / 48.1 s**；**分模型**（4B DM + 1.7B 助手、ctx 4096）= **109.9 / 275.9 / 235.7 s**。
+⇒ 在 8 GiB 显存上**分模型净亏 2.6×**（1.7B 上卡后只剩 0.29 GiB free，4B 的 KV 装不下 ⇒
+WDDM 把显存换到主存，`nvidia-smi` 100% util 但零吞吐）；而"越跑越慢"消失了
+（旧 `.dll` 80→128→>240 单调变慢，新 `.dll` 129→65→48 单调变快，三轮总量 ~1.85×）。
+⚠️ **轮内生成次数由模型临场决定，单轮噪声极大 —— 只信趋势与量级。**
+
+⚠️ **两项都仍远未达 [设计文档 §5](docs/DESIGN.md) 的目标**（4B decode 16.9 / 60、prefill 104.9 / 1000）。
+而且**"bit-exact + 当前线程→元素映射"这条路已到顶**：再要 decode 提速只剩
+"动线程→元素映射"（放掉逐位，但 P1/P2 的判据本来就是相对误差）或"缩短依赖链"。
 
 ## 编译
 
@@ -175,12 +218,13 @@ bash tests/run_p1.sh             # ① 反量化逐位对拍 ② 整网逐层对
 bash tests/run_p2.sh             # ⓿ KV 映射（不需要模型）① KV 自检 ② 逐 token 对拍
 bash tests/run_p3.sh             # 设备端采样（不需要模型、不需要权重，几秒跑完）
 bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量（要权重）
+bash tests/run_p4.sh             # P4：CUDA Graph 判据 A–E + 通用/专用 kernel 逐位对拍（要权重）
 ```
 
 分两档的理由 —— **"骨架能编、错误路径说人话"和"算力实现了没有"是两件事**，
 前者不该被显卡卡住。
 
-### 已验过的（2026-10-12 ~ 10-13）
+### 已验过的（2026-10-12 ~ 10-14）
 
 | 项 | 环境 | 结果 |
 | --- | --- | --- |
@@ -208,8 +252,12 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 | **端到端多轮生成**（`ctypes` 直调 ABI） | WSL + CUDA 13.2 | 单轮 `finish=stop`、文本通顺；同会话第二轮**前缀复用**生效（`prompt_tokens` 17 → 37）；权重上卡 **1.05 GiB / 6.6–8.9 s**；会话 KV（1024）**112 MiB** |
 | **`engine_probe.py --backend gpu`**（RPGBar 仓库） | **Windows + CUDA 产物** | `实际后端: gpu`；`device_bytes 1122428928`；**0.9 s / 15 token（16.3 tok/s）**；工具调用正常；**退出时 `cudaFree` 警告 0 行** |
 | **游戏内端到端**（RPGBar 服务器，同一串动作 × 3 轮） | **Windows + CUDA 产物** | configure 后 `lib_name: "rpg_engine_cuda.dll"` / `backend: "gpu"` / `backend_fallback: false`；三轮 **37.5 / 27.7 / 21.5 s**（CPU 同串动作 **199.3 / 114.4 / 109.2 s**）⇒ **快 4.1–5.3×**；日志里 `已创建会话（模型 #1，缓存容量 6144，KV 约 672 MiB）` + `设备: NVIDIA GeForce RTX 5060 Laptop GPU`；**0 条降级** |
-| **`scripts/smoke_test.py --unit`**（RPGBar 仓库） | Windows | **258 通过 / 0 失败**（GPU 探测用例 4 → 5 条） |
-| **`ui_check.js`**（RPGBar 仓库，真服务器） | Windows | **115 通过 / 0 失败** |
+| **`run_p4.sh`**（P4 ① 图判据 A–E） | WSL + CUDA 13.2 | 图路径 vs 老路径**逐位相同**（贪心 / 纯采样 / 带筛选采样），每组都**同时断言 `graph_exec != nullptr`**；性能只 **1.00–1.09×** ⇒ 原判断被证伪 |
+| **`matmul_bench --verify`**（P4 ②） | WSL + CUDA 13.2 | 8 张矩阵 × {1,3,5,8} token、Q4_K / Q6_K 两条专用 kernel **全部 0 个 bit 不同**（含 `lm_head` 151936 行） |
+| **`matmul_bench --verify`**（P4 ③，4B） | WSL + CUDA 13.2 | 8 张矩阵 × {1,2,3,4,5,8,16} token **全部 0 个 bit 不同**（覆盖三档形状，含 `ffn_down` nb=38） |
+| **整轮实测**（RPGBar 服务器，4B，新 `.dll`） | **Windows + CUDA 产物** | 单模型 3 轮 **129.4 / 65.0 / 48.1 s**；分模型（4B DM + 1.7B 助手）3 轮 **109.9 / 275.9 / 235.7 s** ⇒ 8 GiB 上分模型净亏 2.6×；旧 `.dll`的"越跑越慢"消失 |
+| **`scripts/smoke_test.py --unit`**（RPGBar 仓库） | Windows | **357 通过 / 0 失败**（GPU 探测用例 4 → 5 条；这个数字随 RPGBar 补用例而变，当年是 258） |
+| **`ui_check.js`**（RPGBar 仓库，真服务器） | Windows | **170 通过 / 0 失败**（当年是 115） |
 
 ### P1 实测（21 token prefill，同一 prompt / 同一份 GGUF）
 
@@ -232,6 +280,8 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 > 28 层 × 十几个 kernel ≈ **400 次启动**，外加一次 argmax 的 4 字节回传同步。
 > **瓶颈已经从"算力"换成了"启动开销 + 同步"** —— 这正是 P4 的 CUDA Graph 要解决的
 > （把几百次启动摊成一次）。P2 的任务是"把对拍做对"，这个数字是 P4 的起点。
+> ⚠️ **P4 做完后这条归因被推翻了**：Graph 只值 1.00–1.09×，真瓶颈是逐元素反量化的 ALU
+> 加上 kernel 之间的依赖链 —— 见下面「P4 实测」。
 
 > 98 tok/s 离 P4 的 1000 tok/s 目标还远，**但现在不该优化**：21 个 token 的 GEMM 每个都是
 > `1×2048` 乘 `2048×6144`，小到吃不满 26 个 SM。P4 的目标要在 ≥512 token 上量。
@@ -245,6 +295,10 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 
 两个数字都离 P4 的 60 tok/s 目标还远，而且**离瓶颈很远**：decode 每步约 400 次 kernel
 启动 + 一次同步才是主因（见上面 P2 那张表）。采样加进去的是"几步 kernel"，不是"几百步"。
+
+> ⚠️ **"离瓶颈很远"这句也是错的**（P4 修完才看清）：decode 的真实成本大头是
+> **逐元素反量化的 ALU**，采样确实只占"几步 kernel"。这句话里的目标（60 tok/s）
+> 到现在**仍未达到**，P4 只把 decode 推到 **16.8–16.9 tok/s（4B）/ 26.9 tok/s（1.7B）**。
 
 ### P3 第三步的实测（Windows 产物，即宿主真正加载的那一份）
 
@@ -318,6 +372,23 @@ bash tests/run_p3_gen.sh         # 采样接进 decode 之后的五条不变量�
 **逐级加参数二分**（t1–t15），十几分钟就把"哪个开关有问题"钉死了 —— 而不是盯着 13 个
 文件的 62 条报错猜。详细过程见 [设计文档 §8](docs/DESIGN.md)。
 
+**P4 四步都没有新的编译坑，但抓到三类"量出来的数是假的"**，比编译坑更容易骗人：
+
+1. 🔴 **判据工具自己写死了前提**：`matmul_bench` 的逐矩阵表原来把 `n_tokens` 写死成 1
+   ⇒ 用 `--tokens 64` 扫 prefill 形状时，两次"不同 n"的扫描给出**逐位相同**的排名；
+   连跑十轮不洗牌 ⇒ 量到的是**笔记本功耗墙**（第一轮 85 GB/s、最后一轮 ~40，
+   排序几乎等于跑的先后顺序）。修法：新增 `--per-matrix-tokens`，扫参脚本改成
+   **多轮交错 + 每轮随机顺序 + 取每组合最优**。另：聚合行（`BenchOnce`）**不可信** ——
+   与逐矩阵表能差到 2 倍，这一轮甚至给出**相反**的结论。
+2. 🔴 **静默错误：图回放绕过了一层缓存**。`StagePos0Cached` 把 `pos0` 暂存区的当前值
+   缓存在**函数局部 `static`**，而图回放直接调 `StagePos0` 绕过缓存 ⇒ 缓存说谎 ⇒
+   下一个会话从位置 0 prefill 时被判"已经是 0"而跳过写入、**那次 prefill 的 RoPE 位置全错**。
+   症状极隐蔽：贪心组刚好撞对、采样组 32/32 全不同。已把缓存搬进 `cuda_common`。
+3. ⚠️ **"kernel 快了"不等于"引擎快了"**（这是本轮最有价值的一条）：
+   专用 kernel 1.56×，按层数折算 decode 本应 1.85×，实测 **1.0×** ⇒
+   **decode 的时间不在 kernel 里，在 kernel 之间的空隙里**。同一个数字可自洽解释
+   Graph 为何只值 1.00–1.06×。**要判断"提速传到哪一层"，必须在真链路上量，不能在 bench 里折算。**
+
 ## 用起来
 
 产物是 `rpg_engine.dll` / `librpg_engine.so`，与 CPU 版**同名同 ABI**。
@@ -353,11 +424,15 @@ tests/                  ← check_sync.py（副本有没有跑偏）、
                           run_p1.sh / cmp_layers.py（P1 一键判据）、
                           run_p2.sh / cmp_gen.py（P2 一键判据）、
                           run_p3.sh / cmp_sample.py（P3 一键判据，不需要模型）、
-                          run_p3_gen.sh（P3 的生成循环判据，要权重）
+                          run_p3_gen.sh（P3 的生成循环判据，要权重）、
+                          run_p4.sh（P4 一键判据：图 A–E + kernel 逐位对拍，要权重）
 tools/                  ← cuda_check / dequant_check / layer_check / gen_check
                           / kv_map_check（KV 映射，不需要模型）
                           / sample_check（采样，不需要模型）
                           / gen_sample_check（采样接进 decode 后的不变量，要模型）
+                          / graph_check（P4 ①：图路径 vs 老路径，判据 A–E）
+                          / matmul_bench（P4 ②③：逐矩阵归属表 / 通用 vs 专用逐位对拍
+                            / --bw 带宽天花板 / --per-matrix-tokens）
                           + build_cpu_ref.sh（现编 CPU 引擎做参考侧：
                             forward_check / cpu_ref_gen / cpu_ref_sample）
                           + cpu_ref_gen.cc / cpu_ref_sample.cc（只有 main，实现来自 CPU 引擎）
